@@ -28,6 +28,17 @@
        set diam lewat dropdown di tab Farm > Equipment Set. Saat pedang
        terhunus karakter pindah ke set pedang, saat pickaxe keluar pindah ke
        set mining.
+   10. Auto ascend: saat Heart di room 50 membuka cabang Rift, game mengirim
+       draft berisi kartu The Hollow dan The Heavens. Hub memilih salah satu
+       sesuai dropdown di tab Relic > Auto Ascend, jadi pemain tidak perlu
+       menekan kartu manual.
+
+    11. Keluar run: tab Run punya tombol Rerun dan Ke Hub. Kalau layar hasil
+        sedang terbuka, hub memakai SummaryController:Hide (jalur yang sama
+        dengan tombol Again/Hub). Di tengah run, hub mengirim LeaveRun langsung.
+        Rerun lalu mengirim StartSession(worldId) setelah server benar-benar
+        keluar dari sesi lama. Mode otomatis bisa memilih salah satu saat layar
+        hasil muncul.
 
   Catatan protokol (dibaca dari StrataClient.Controllers):
     - MiningInput mengirim StrataNet.Aim:FireServer(x, z, true) lalu Aim(0, 0, false) saat lepas.
@@ -44,6 +55,14 @@
       lalu mengirim StrataNet.PickRelic:FireServer(index 1..n). Offer dengan
       cards = trader (mode "trader"), shrine blessing (mode "shrine"), atau
       pilihan path (mode "choice"). offer.closed = true berarti draft ditutup.
+    - SummaryController:Hide("rerun"/"hub") menutup layar hasil, memanggil
+      RunEndStage:Leave(), lalu mengirim StrataNet.LeaveRun. LeaveRun hanya
+      mengakhiri sesi lama; run baru dimulai oleh StrataNet.StartSession(worldId)
+      dari MenuController:StartRun. StartSession ditolak server ("already in a
+      run") kalau sesi lama belum selesai, jadi harus dikirim setelah hub.
+    - Tombol End Run di HUD memakai StrataNet.EndSession, tetapi remote itu
+      tidak selalu diterima di run tambang biasa; LeaveRun("hub"/"rerun")
+      tetap bisa dipakai di tengah run.
 
   Pemakaian:
     loadstring(readfile("AIBridge/inbox.lua"))()
@@ -51,10 +70,15 @@
     getgenv().DelveFarm.Start() / .Pause() / .Resume() / .Stop() / .Destroy()
     getgenv().DelveFarm.SetFly(true/false) / .ToggleFly()
     getgenv().DelveFarm.SetRelicPriority({ "blast", "echo" })
+    getgenv().DelveFarm.SetAutoAscend(true/false)
+    getgenv().DelveFarm.SetAscendTo("hollow" / "farside")
     getgenv().DelveFarm.SetPathPick("safe" / "cursed" / "manual")
     getgenv().DelveFarm.SetTraderMode("manual" / "priority" / "relic" / "cheapest", hargaMaks)
     getgenv().DelveFarm.SetLoadoutAuto(true/false)
     getgenv().DelveFarm.SetLoadoutSets(setPedang, setMining, setIdle)
+    getgenv().DelveFarm.LeaveRun("rerun" / "hub")
+    getgenv().DelveFarm.SetLeaveMode("rerun" / "hub")
+    getgenv().DelveFarm.SetAutoLeave(true/false)
 
   Catatan:
     - Auto Farm sengaja mulai dalam keadaan mati. Nyalakan lewat toggle di tab Farm.
@@ -132,6 +156,17 @@ local CFG = {
     traderMode = "manual",     -- "manual" / "priority" / "relic" / "cheapest"
     traderMaxPrice = 0,        -- 0 = tanpa batas harga
 
+    -- auto ascend: pilih The Hollow / The Heavens saat Heart membuka cabang Rift
+    autoAscend = true,         -- pilih realm otomatis
+    ascendTo = "hollow",       -- "hollow" / "farside"
+    ascendDelay = 0.35,        -- jeda sebelum mengirim pilihan ascend, detik
+
+    -- keluar run (StrataNet.LeaveRun)
+    leaveMode = "rerun",       -- "rerun" / "hub", tujuan tombol otomatis
+    autoLeave = false,         -- keluar otomatis saat layar hasil muncul
+    autoLeaveDelay = 2,        -- jeda sebelum keluar otomatis, detik
+    leaveCooldown = 3,         -- jeda minimum antar perintah LeaveRun, detik
+
     -- fly / hover
     fly = false,               -- modul terbang aktif (manual + hover)
     flySpeed = 60,             -- kecepatan horizontal, stud/detik
@@ -199,6 +234,118 @@ if not loadoutRemote then
     warn("[DelveFarm] SwapLoadout tidak ditemukan, auto equipment set dimatikan.")
 end
 
+-- Keluar run. Remote LeaveRun hanya mengakhiri sesi; run baru dimulai oleh
+-- StartSession (dipakai MenuController:StartRun).
+local leaveRunRemote = net:FindFirstChild("LeaveRun")
+local startSessionRemote = net:FindFirstChild("StartSession")
+if not leaveRunRemote then
+    warn("[DelveFarm] LeaveRun tidak ditemukan, tombol keluar run dimatikan.")
+end
+
+-- Ringkasan run (SummaryController) hanya bisa dipanggil lewat tabel controller
+-- milik StrataClient. Tabel itu diambil lewat helper equipment set supaya
+-- filtergc tidak dipanggil berkali-kali.
+local ensureStrataApp
+
+local function getApp()
+    if type(ensureStrataApp) ~= "function" then
+        return nil
+    end
+    return ensureStrataApp(os.clock())
+end
+
+local function getSummary()
+    local app = getApp()
+    if not app or type(app.Controllers) ~= "table" then
+        return nil
+    end
+    local summary = app.Controllers.SummaryController
+    if type(summary) == "table" and type(summary.Hide) == "function" then
+        return summary
+    end
+    return nil
+end
+
+local function currentWorldId()
+    local app = getApp()
+    local area = app and app.State and app.State.aim and app.State.aim.area
+    if area and type(area.worldId) == "string" and not area.isHub then
+        return area.worldId
+    end
+
+    local summary = getSummary()
+    if summary and type(summary.lastSummary) == "table" then
+        local worldId = summary.lastSummary.worldId
+        if type(worldId) == "string" and worldId ~= "" then
+            return worldId
+        end
+    end
+    return nil
+end
+
+local function isHubArea()
+    local app = getApp()
+    local area = app and app.State and app.State.aim and app.State.aim.area
+    return area ~= nil and area.isHub == true
+end
+
+-- Setelah LeaveRun, server butuh waktu untuk menutup sesi lama. StartSession
+-- yang dikirim terlalu cepat ditolak dengan "already in a run", jadi tunggu
+-- sampai pemain benar-benar di hub, lalu coba beberapa kali.
+local function startWorldRun(worldId, oldPlate)
+    if not startSessionRemote or type(worldId) ~= "string" or worldId == "" then
+        return false
+    end
+
+    local left = false
+    local attempts = 0
+    local deadline = os.clock() + 20
+
+    while os.clock() < deadline do
+        if isHubArea() then
+            left = true
+        end
+
+        local area = nil
+        local app = getApp()
+        if app and app.State and app.State.aim then
+            area = app.State.aim.area
+        end
+        local plate = workspace:FindFirstChild("StrataPlate")
+
+        -- Plate baru (instance berbeda dari plate run lama) berarti run sudah
+        -- dimulai. Ini juga menangkap rerun yang langsung berpindah tanpa
+        -- sempat mampir ke hub.
+        if plate and plate ~= oldPlate and area and area.isHub ~= true and area.worldId == worldId then
+            return true
+        end
+
+        if left and not plate and attempts < 12 then
+            attempts = attempts + 1
+            startSessionRemote:FireServer(worldId)
+        end
+
+        task.wait(0.75)
+    end
+
+    return false
+end
+
+local LEAVE_LABELS = { rerun = "Rerun", hub = "Ke Hub" }
+local LEAVE_KEYS = { ["Rerun"] = "rerun", ["Ke Hub"] = "hub" }
+
+-- StrataPlate hanya ada saat run berjalan. Layar hasil bisa muncul saat plate
+-- sudah hilang, jadi keduanya dipakai untuk memastikan pemain memang di run.
+local function isInRun()
+    return workspace:FindFirstChild("StrataPlate") ~= nil
+end
+
+local function isRunEndVisible()
+    local pg = plr:FindFirstChildOfClass("PlayerGui")
+    local gui = pg and pg:FindFirstChild("RunEnd")
+    return gui ~= nil and gui:IsA("ScreenGui") and gui.Enabled
+end
+
 -- ============================================================
 -- State
 -- ============================================================
@@ -239,6 +386,11 @@ local S = {
     swingCache = nil,
     keybind = nil,
     toggle = nil,
+
+    -- keluar run
+    lastLeaveAt = 0,
+    autoLeaveArmed = false,
+    runCard = nil,
 
     -- fly
     flyOn = false,
@@ -284,6 +436,12 @@ local S = {
     connRelic = nil,
     relicDropdown = nil,
     relicCard = nil,
+
+    -- auto ascend
+    ascendPicks = 0,
+    ascendLast = nil,
+    ascendToggle = nil,
+    ascendDropdown = nil,
 
     -- equipment set (loadout)
     app = nil,
@@ -764,6 +922,12 @@ local TRADER_LABELS = {
     cheapest = "Termurah",
 }
 local TRADER_MODES = { manual = true, priority = true, relic = true, cheapest = true }
+local ASCEND_LABELS = { hollow = "The Hollow", farside = "The Heavens" }
+local ASCEND_KEYS = { hollow = true, farside = true }
+local ASCEND_LABEL_TO_KEY = {
+    [ASCEND_LABELS.hollow] = "hollow",
+    [ASCEND_LABELS.farside] = "farside",
+}
 
 local function relicRank(def)
     if not def then
@@ -873,6 +1037,9 @@ local function saveRelicPrefs()
             path = CFG.pathPick,
             trader = CFG.traderMode,
             traderMax = CFG.traderMaxPrice,
+            ascend = CFG.autoAscend,
+            ascendTo = CFG.ascendTo,
+            ascendDelay = CFG.ascendDelay,
             ids = S.relicOrder,
         })
         writefile(RELIC_PREFS_FILE, json)
@@ -911,6 +1078,15 @@ local function loadRelicPrefs()
     if type(data.traderMax) == "number" then
         CFG.traderMaxPrice = math.clamp(data.traderMax, 0, 5000000)
     end
+    if type(data.ascend) == "boolean" then
+        CFG.autoAscend = data.ascend
+    end
+    if type(data.ascendTo) == "string" and ASCEND_KEYS[data.ascendTo] then
+        CFG.ascendTo = data.ascendTo
+    end
+    if type(data.ascendDelay) == "number" then
+        CFG.ascendDelay = math.clamp(data.ascendDelay, 0, 2)
+    end
     local ids = {}
     for _, id in ipairs(data.ids or {}) do
         if type(id) == "string" then
@@ -935,6 +1111,109 @@ local function resolveRelicId(value)
         end
     end
     return relicNameToId[string.upper(value)]
+end
+
+-- Auto ascend. Pilihan realm memakai draft kartu yang sama dengan relic:
+-- satu kartu The Hollow dan satu kartu The Heavens. Keduanya harus ada
+-- supaya item trader yang namanya mirip tidak ikut terpilih.
+local function normalizeRealmText(value)
+    if type(value) ~= "string" then
+        return ""
+    end
+    local text = string.upper(value)
+    text = text:gsub("%s+", " ")
+    text = text:gsub("^%s+", "")
+    text = text:gsub("%s+$", "")
+    return text
+end
+
+local function textHasName(text, name)
+    local start = 1
+    while true do
+        local at = text:find(name, start, true)
+        if not at then
+            return false
+        end
+        local after = text:sub(at + #name, at + #name)
+        if after == "" or not after:match("%a") then
+            return true
+        end
+        start = at + #name
+    end
+end
+
+local function realmFromText(value)
+    local text = normalizeRealmText(value)
+    if text == "" then
+        return nil
+    end
+    if text == "HOLLOW" or textHasName(text, "THE HOLLOW") then
+        return "hollow"
+    end
+    if text == "HEAVEN"
+        or text == "HEAVENS"
+        or textHasName(text, "THE HEAVEN")
+        or textHasName(text, "THE HEAVENS")
+    then
+        return "farside"
+    end
+    return nil
+end
+
+local function realmFromId(value)
+    if type(value) ~= "string" then
+        return nil
+    end
+    local id = string.lower(value)
+    if ASCEND_KEYS[id] then
+        return id
+    end
+    if id == "heaven" or id == "heavens" then
+        return "farside"
+    end
+    return nil
+end
+
+local function realmOfCard(card)
+    if type(card) ~= "table" then
+        return nil
+    end
+    local id = realmFromId(card.id)
+    if id then
+        return id
+    end
+    return realmFromText(card.title)
+        or realmFromText(card.name)
+        or realmFromText(card.tier)
+        or realmFromText(card.bonus)
+        or realmFromText(card.stat)
+end
+
+local function realmIndices(cards)
+    local hollowIndex, farsideIndex
+    for i, card in ipairs(cards or {}) do
+        local realm = realmOfCard(card)
+        if realm == "hollow" and not hollowIndex then
+            hollowIndex = i
+        elseif realm == "farside" and not farsideIndex then
+            farsideIndex = i
+        end
+    end
+    if hollowIndex and farsideIndex then
+        return hollowIndex, farsideIndex
+    end
+    return nil
+end
+
+local function chooseAscendIndex(cards)
+    local hollowIndex, farsideIndex = realmIndices(cards)
+    if not hollowIndex then
+        return nil
+    end
+    if CFG.ascendTo == "farside" then
+        return farsideIndex, "ascend ke " .. ASCEND_LABELS.farside
+    end
+    return hollowIndex, "ascend ke " .. ASCEND_LABELS.hollow
 end
 
 -- candidates: { index = number, id = string?, rank = number }
@@ -1107,6 +1386,15 @@ local function chooseCardIndex(cards, offer)
         return nil, "tidak ada kartu"
     end
 
+    -- Cabang Rift (The Hollow / The Heavens) memakai kartu yang sama.
+    -- Cek ini lebih dulu supaya pilihan ascend tidak dianggap path biasa.
+    if CFG.autoAscend then
+        local ascendIndex, ascendReason = chooseAscendIndex(cards)
+        if ascendIndex then
+            return ascendIndex, ascendReason
+        end
+    end
+
     local mode = type(offer) == "table" and offer.mode or nil
     if mode == "choice" then
         return choosePathIndex(cards)
@@ -1184,18 +1472,29 @@ local function onRelicOffer(offer)
 
     local names = {}
     local index, reason
+    local isAscend = false
     if isCards then
         for _, card in ipairs(offer.cards) do
             names[#names + 1] = cardName(card)
         end
-        if CFG.autoRelic then
+        if CFG.autoAscend then
+            index, reason = chooseAscendIndex(offer.cards)
+            isAscend = index ~= nil
+        end
+        if not index and CFG.autoRelic then
             index, reason = chooseCardIndex(offer.cards, offer)
         end
     else
+        local realmCards = {}
         for _, id in ipairs(choices) do
             names[#names + 1] = relicName(id)
+            realmCards[#realmCards + 1] = { id = id }
         end
-        if CFG.autoRelic then
+        if CFG.autoAscend then
+            index, reason = chooseAscendIndex(realmCards)
+            isAscend = index ~= nil
+        end
+        if not index and CFG.autoRelic then
             index, reason = chooseRelicIndex(choices)
         end
     end
@@ -1203,13 +1502,13 @@ local function onRelicOffer(offer)
     S.relicSeq = S.relicSeq + 1
     local seq = S.relicSeq
 
-    if not CFG.autoRelic then
+    if not CFG.autoRelic and not isAscend then
         S.relicStatus = "Draft: " .. table.concat(names, " | ")
         return
     end
 
-    if not (relicPickRemote and Relics) then
-        S.relicStatus = "Fitur relic tidak tersedia."
+    if not relicPickRemote then
+        S.relicStatus = "Fitur draft tidak tersedia."
         return
     end
 
@@ -1229,9 +1528,11 @@ local function onRelicOffer(offer)
         label = relicName(choices[index])
     end
 
-    local delay = math.clamp(tonumber(CFG.relicDelay) or 0, 0, 2)
+    local delayValue = isAscend and CFG.ascendDelay or CFG.relicDelay
+    local delay = math.clamp(tonumber(delayValue) or 0, 0, 2)
     S.relicStatus = string.format(
-        "Draft: %s. Memilih %s (%s) dalam %.2fs.",
+        "%s: %s. Memilih %s (%s) dalam %.2fs.",
+        isAscend and "Ascend" or "Draft",
         table.concat(names, " | "),
         label,
         reason,
@@ -1264,10 +1565,17 @@ local function onRelicOffer(offer)
                 gui.Enabled = false
             end)
         end
-        S.relicPicks = S.relicPicks + 1
-        S.relicLast = label
-        S.relicStatus = string.format("Terpilih: %s (%s).", label, reason)
-        print("[DelveFarm] relic: " .. label .. " (" .. reason .. ")")
+        if isAscend then
+            S.ascendPicks = S.ascendPicks + 1
+            S.ascendLast = label
+            S.relicStatus = string.format("Ascend terpilih: %s.", label)
+            print("[DelveFarm] ascend: " .. label)
+        else
+            S.relicPicks = S.relicPicks + 1
+            S.relicLast = label
+            S.relicStatus = string.format("Terpilih: %s (%s).", label, reason)
+            print("[DelveFarm] relic: " .. label .. " (" .. reason .. ")")
+        end
     end)
 end
 
@@ -1292,6 +1600,17 @@ local function relicStatusText()
         traderLine = traderLine .. " (maks " .. tostring(math.floor(CFG.traderMaxPrice)) .. ")"
     end
     lines[#lines + 1] = traderLine
+    local ascendLine = "Ascend: "
+    if CFG.autoAscend then
+        ascendLine = ascendLine .. (ASCEND_LABELS[CFG.ascendTo] or "The Hollow") .. " (otomatis)"
+    else
+        ascendLine = ascendLine .. "Manual"
+    end
+    lines[#lines + 1] = ascendLine
+    if S.ascendPicks > 0 then
+        local last = S.ascendLast and (" (" .. S.ascendLast .. ")") or ""
+        lines[#lines + 1] = "Ascend dipilih: " .. tostring(S.ascendPicks) .. last
+    end
     if S.relicLast then
         lines[#lines + 1] = "Terakhir: " .. S.relicLast
     end
@@ -1310,7 +1629,7 @@ end
 buildRelicOptions()
 loadRelicPrefs()
 
-if relicOfferRemote and relicPickRemote and Relics then
+if relicOfferRemote and relicPickRemote then
     S.connRelic = relicOfferRemote.OnClientEvent:Connect(onRelicOffer)
 end
 
@@ -1372,7 +1691,7 @@ local function findStrataApp()
     return nil
 end
 
-local function ensureStrataApp(now)
+ensureStrataApp = function(now)
     if S.app then
         return S.app
     end
@@ -2364,6 +2683,182 @@ function api.SetTraderMode(value, maxPrice)
     return true
 end
 
+function api.SetAutoAscend(on)
+    CFG.autoAscend = on and true or false
+    if S.ascendToggle then
+        pcall(function()
+            S.ascendToggle:Set(CFG.autoAscend, true)
+        end)
+    end
+    saveRelicPrefs()
+    refreshRelicStatus()
+    return CFG.autoAscend
+end
+
+function api.SetAscendTo(value)
+    if type(value) ~= "string" or not ASCEND_KEYS[value] then
+        return false
+    end
+    CFG.ascendTo = value
+    if S.ascendDropdown then
+        pcall(function()
+            S.ascendDropdown:Set(ASCEND_LABELS[value], true)
+        end)
+    end
+    saveRelicPrefs()
+    refreshRelicStatus()
+    return true
+end
+
+function api.SetLeaveMode(value)
+    if type(value) ~= "string" or not LEAVE_LABELS[value] then
+        return false
+    end
+    CFG.leaveMode = value
+    if S.leaveDropdown then
+        pcall(function()
+            S.leaveDropdown:Set(LEAVE_LABELS[value], true)
+        end)
+    end
+    return true
+end
+
+function api.SetAutoLeave(on)
+    CFG.autoLeave = on and true or false
+    if not CFG.autoLeave then
+        S.autoLeaveArmed = false
+    end
+    if S.leaveToggle then
+        pcall(function()
+            S.leaveToggle:Set(CFG.autoLeave, true)
+        end)
+    end
+    return CFG.autoLeave
+end
+
+function api.LeaveRun(mode)
+    if type(mode) ~= "string" or not LEAVE_LABELS[mode] then
+        mode = CFG.leaveMode
+    end
+    if not leaveRunRemote then
+        BPUI:Notify({
+            Title = "Run",
+            Content = "Remote LeaveRun tidak ditemukan.",
+            Type = "Error",
+            Duration = 4,
+        })
+        return false
+    end
+    if not (isInRun() or isRunEndVisible()) then
+        BPUI:Notify({
+            Title = "Run",
+            Content = "Kamu tidak sedang di dalam run.",
+            Type = "Warning",
+            Duration = 3,
+        })
+        return false
+    end
+
+    local now = os.clock()
+    if now - S.lastLeaveAt < CFG.leaveCooldown then
+        BPUI:Notify({
+            Title = "Run",
+            Content = "Tunggu sebentar sebelum mengirim lagi.",
+            Type = "Warning",
+            Duration = 2,
+        })
+        return false
+    end
+    S.lastLeaveAt = now
+
+    -- World harus dibaca sebelum run ditutup, karena area berubah ke hub
+    -- begitu server mengeluarkan pemain.
+    local worldId = currentWorldId()
+    local oldPlate = workspace:FindFirstChild("StrataPlate")
+    local summary = getSummary()
+
+    -- Bersihkan target lama supaya Auto Farm memindai plate baru setelah
+    -- karakter berpindah, bukan mengejar rock dari run sebelumnya.
+    chestAbort()
+    releaseAim()
+    S.mode = nil
+    S.rock = nil
+    S.rockX = 0
+    S.rockZ = 0
+    S.rockPos = nil
+    S.stand = nil
+    S.rocks = {}
+    S.rocksAt = 0
+    S.teleportedAt = 0
+    S.pendingSwing = nil
+    S.forceDive = false
+    S.trackedMob = nil
+    S.trackedSwings = 0
+
+    if mode == "hub" then
+        api.Stop()
+    end
+
+    BPUI:Notify({
+        Title = "Run",
+        Content = mode == "rerun" and "Rerun: menutup run lama..." or "Keluar run: kembali ke hub...",
+        Type = "Info",
+        Duration = 3,
+    })
+
+    task.spawn(function()
+        if not S.alive then
+            return
+        end
+        -- SummaryController:Hide adalah jalur tombol Again/Hub: menutup layar
+        -- hasil, memanggil RunEndStage:Leave(), lalu mengirim LeaveRun.
+        -- Di tengah run layar hasil belum terbuka, jadi LeaveRun dikirim
+        -- langsung; server mengizinkannya dan mengeluarkan pemain ke hub.
+        local usedHide = false
+        if isRunEndVisible() and summary then
+            usedHide = pcall(function()
+                summary:Hide(mode)
+            end)
+        end
+
+        if not usedHide then
+            leaveRunRemote:FireServer(mode)
+        end
+
+        if mode ~= "rerun" then
+            return
+        end
+
+        if not worldId then
+            BPUI:Notify({
+                Title = "Run",
+                Content = "Rerun gagal: world run tidak terbaca.",
+                Type = "Warning",
+                Duration = 4,
+            })
+            return
+        end
+
+        if startWorldRun(worldId, oldPlate) then
+            BPUI:Notify({
+                Title = "Run",
+                Content = "Run baru dimulai: " .. worldId .. ".",
+                Type = "Success",
+                Duration = 3,
+            })
+        else
+            BPUI:Notify({
+                Title = "Run",
+                Content = "Rerun gagal: server belum menerima StartSession.",
+                Type = "Warning",
+                Duration = 5,
+            })
+        end
+    end)
+
+    return true
+end
+
 function api.Destroy()
     S.uiAlive = false
     api.SetFly(false)
@@ -2523,6 +3018,25 @@ local function statusText()
     return table.concat(lines, "\n")
 end
 
+local function runStatusText()
+    local lines = {}
+    lines[#lines + 1] = "Auto: " .. (CFG.autoLeave and "aktif" or "mati")
+    lines[#lines + 1] = "Tujuan: " .. (LEAVE_LABELS[CFG.leaveMode] or "Rerun")
+    if isRunEndVisible() then
+        lines[#lines + 1] = "Layar hasil: terbuka"
+    else
+        lines[#lines + 1] = "Layar hasil: tertutup"
+    end
+    lines[#lines + 1] = "Posisi: " .. (isInRun() and "di dalam run" or "di hub")
+    if S.lastLeaveAt > 0 then
+        local ago = os.clock() - S.lastLeaveAt
+        if ago < 60 then
+            lines[#lines + 1] = string.format("Keluar terakhir: %.0f detik lalu", ago)
+        end
+    end
+    return table.concat(lines, "\n")
+end
+
 -- ============================================================
 -- UI
 -- ============================================================
@@ -2538,6 +3052,7 @@ local Window = BPUI:CreateWindow({
 })
 
 local FarmTab = Window:CreateTab({ Name = "Farm", Icon = "activity" })
+local RunTab = Window:CreateTab({ Name = "Run", Icon = "rotate-ccw" })
 local MineTab = Window:CreateTab({ Name = "Mining", Icon = "gem" })
 local CombatTab = Window:CreateTab({ Name = "Combat", Icon = "sword" })
 local FlyTab = Window:CreateTab({ Name = "Terbang", Icon = "wind" })
@@ -2791,6 +3306,85 @@ local StatusSection = FarmTab:CreateSection("Status")
 local statusCard = StatusSection:AddParagraph({
     Title = "Status",
     Content = statusText(),
+})
+
+-- ------------------------------------------------------------
+-- Tab Run
+-- ------------------------------------------------------------
+
+local LeaveSection = RunTab:CreateSection("Keluar Run")
+
+LeaveSection:AddParagraph({
+    Title = "Pilihan Tujuan",
+    Content = "Kalau layar hasil sedang terbuka, tombol di bawah memakai fungsi "
+        .. "SummaryController:Hide milik game (jalur tombol Again/Hub). Kalau "
+        .. "ditekan di tengah run, hub mengirim LeaveRun langsung. Rerun lalu "
+        .. "mengirim StartSession dengan world yang sama setelah server selesai "
+        .. "mengeluarkan pemain dari sesi lama; StartSession yang terlalu cepat "
+        .. "ditolak dan dicoba ulang otomatis.",
+})
+
+LeaveSection:AddButton({
+    Name = "Rerun Sekarang",
+    Style = "Accent",
+    Description = "Tutup run lama lalu mulai run baru dengan world yang sama. Auto Farm tetap berjalan.",
+    Callback = function()
+        api.LeaveRun("rerun")
+    end,
+})
+
+LeaveSection:AddButton({
+    Name = "Ke Hub Sekarang",
+    Description = "Akhiri run (di tengah run sekalipun) dan kembali ke hub. Auto Farm ikut dimatikan.",
+    Callback = function()
+        api.LeaveRun("hub")
+    end,
+})
+
+local AutoLeaveSection = RunTab:CreateSection("Otomatis")
+
+S.leaveToggle = AutoLeaveSection:AddToggle({
+    Name = "Keluar Otomatis Saat Run Selesai",
+    Description = "Saat layar hasil (RunEnd) muncul, hub mengirim tujuan di bawah tanpa menunggu tombol ditekan.",
+    Default = CFG.autoLeave,
+    Flag = "DelveAutoLeave",
+    Callback = function(on)
+        api.SetAutoLeave(on)
+    end,
+})
+
+S.leaveDropdown = AutoLeaveSection:AddDropdown({
+    Name = "Tujuan Otomatis",
+    Description = "Dipakai oleh toggle di atas saat run selesai.",
+    Options = { "Rerun", "Ke Hub" },
+    Default = LEAVE_LABELS[CFG.leaveMode] or "Rerun",
+    Flag = "DelveLeaveMode",
+    Callback = function(value)
+        local label = type(value) == "table" and value[1] or value
+        local key = LEAVE_KEYS[label]
+        if key then
+            CFG.leaveMode = key
+        end
+    end,
+})
+
+AutoLeaveSection:AddSlider({
+    Name = "Jeda Sebelum Keluar",
+    Description = "Beri waktu sebentar supaya layar hasil sempat terbaca.",
+    Min = 0,
+    Max = 10,
+    Default = CFG.autoLeaveDelay,
+    Increment = 1,
+    Suffix = " detik",
+    Flag = "DelveLeaveDelay",
+    Callback = function(v)
+        CFG.autoLeaveDelay = v
+    end,
+})
+
+S.runCard = AutoLeaveSection:AddParagraph({
+    Title = "Status Run",
+    Content = runStatusText(),
 })
 
 -- ------------------------------------------------------------
@@ -3287,7 +3881,62 @@ RelicAutoSection:AddParagraph({
         .. "2. Kalau beberapa prioritas muncul, diambil rarity tertinggi; kalau sama, urutan pilih kamu yang menang.\n"
         .. "3. Kalau tidak ada prioritas, fallback mengambil rarity tertinggi di draft.\n"
         .. "4. Draft berbentuk kartu (shrine relic atau blessing) ikut dipilih otomatis.\n"
-        .. "5. Pilihan path dan pembelian trader diatur di bagian 'Path & Trader' (default manual).",
+        .. "5. Pilihan path dan pembelian trader diatur di bagian 'Path & Trader' (default manual).\n"
+        .. "6. Cabang Rift (The Hollow / The Heavens) diatur terpisah di bagian 'Auto Ascend'.",
+})
+
+local AscendSection = RelicTab:CreateSection("Auto Ascend")
+
+S.ascendToggle = AscendSection:AddToggle({
+    Name = "Auto Ascend",
+    Description = "Saat Heart membuka cabang Rift, hub memilih The Hollow atau The Heavens sesuai dropdown.",
+    Flag = "DelveAscendAuto",
+    Default = CFG.autoAscend,
+    Callback = function(on)
+        CFG.autoAscend = on and true or false
+        saveRelicPrefs()
+        refreshRelicStatus()
+    end,
+})
+
+S.ascendDropdown = AscendSection:AddDropdown({
+    Name = "Ascend Ke",
+    Description = "Realm yang dipilih saat draft cabang Rift muncul.",
+    Options = { ASCEND_LABELS.hollow, ASCEND_LABELS.farside },
+    Default = ASCEND_LABELS[CFG.ascendTo],
+    Flag = "DelveAscendTo",
+    Callback = function(value)
+        local label = type(value) == "table" and value[1] or value
+        local key = ASCEND_LABEL_TO_KEY[label]
+        if key then
+            CFG.ascendTo = key
+            saveRelicPrefs()
+            refreshRelicStatus()
+        end
+    end,
+})
+
+AscendSection:AddSlider({
+    Name = "Jeda Sebelum Ascend",
+    Description = "Beri waktu sebentar supaya kartu sempat terlihat sebelum dipilih.",
+    Min = 0,
+    Max = 2,
+    Default = CFG.ascendDelay,
+    Increment = 0.05,
+    Suffix = "s",
+    Flag = "DelveAscendDelay",
+    Callback = function(v)
+        CFG.ascendDelay = v
+        saveRelicPrefs()
+    end,
+})
+
+AscendSection:AddParagraph({
+    Title = "Cara Kerja",
+    Content = "Saat Heart di room 50 membuka cabang Rift, game mengirim draft berisi "
+        .. "kartu The Hollow dan The Heavens. Hub memilih kartu yang cocok dengan "
+        .. "dropdown di atas sebelum waktunya habis. Pilihan ini tidak memakai "
+        .. "prioritas relic dan tetap jalan walau Auto Pilih Relic dimatikan.",
 })
 
 local RelicPickSection = RelicTab:CreateSection("Prioritas Relic")
@@ -3433,7 +4082,8 @@ HelpSection:AddParagraph({
         .. "2. Buka tab Farm, nyalakan Auto Farm.\n"
         .. "3. Atur jarak berdiri dan radius mob kalau posisi teleport terasa aneh.\n"
         .. "4. Buka tab Terbang, nyalakan Fly. Atur ketinggian hover sesuai kebutuhan.\n"
-        .. "5. RightShift menyembunyikan window. Tombol jeda memakai keybind sendiri (default F2).",
+        .. "5. RightShift menyembunyikan window. Tombol jeda memakai keybind sendiri (default F2).\n"
+        .. "6. Buka tab Run untuk memilih Rerun atau Ke Hub, baik lewat tombol maupun otomatis saat run selesai.",
 })
 
 HelpSection:AddParagraph({
@@ -3458,6 +4108,18 @@ HelpSection:AddParagraph({
         .. "hilang, lalu mining lanjut dari sana. "
         .. "Kalau wave terlalu lama, kurangi Radius Chest atau naikkan "
         .. "Batas Bersihkan Wave di tab Farm.",
+})
+
+HelpSection:AddParagraph({
+    Title = "Keluar Run",
+    Content = "Tab Run memakai SummaryController:Hide milik game saat layar hasil terbuka. "
+        .. "Di tengah run, hub mengirim LeaveRun langsung. Rerun tidak berhenti di "
+        .. "LeaveRun: setelah server mengeluarkan pemain, hub mengirim "
+        .. "StartSession(worldId) supaya run baru benar-benar dimulai. Kalau "
+        .. "StartSession ditolak karena sesi lama belum selesai, hub mencoba lagi "
+        .. "selama beberapa detik. Toggle otomatis bekerja saat layar hasil (RunEnd) "
+        .. "terbuka. Ke Hub selalu mematikan Auto Farm lebih dulu; Rerun membiarkan "
+        .. "Auto Farm jalan dan memindai plate baru setelah karakter berpindah.",
 })
 
 HelpSection:AddParagraph({
@@ -3504,6 +4166,34 @@ S.thread = task.spawn(function()
     end
 end)
 
+-- Keluar otomatis. Hanya dipicu sekali per layar hasil: flag autoLeaveArmed
+-- baru dilepas lagi setelah layar hasil tertutup, supaya tidak spam remote.
+S.leaveThread = task.spawn(function()
+    while S.alive do
+        if CFG.autoLeave then
+            local visible = isRunEndVisible()
+            if visible and not S.autoLeaveArmed then
+                S.autoLeaveArmed = true
+                local mode = CFG.leaveMode
+                task.delay(CFG.autoLeaveDelay, function()
+                    if not S.alive or not CFG.autoLeave then
+                        return
+                    end
+                    if not isRunEndVisible() then
+                        return
+                    end
+                    api.LeaveRun(mode)
+                end)
+            elseif not visible then
+                S.autoLeaveArmed = false
+            end
+        else
+            S.autoLeaveArmed = false
+        end
+        task.wait(0.25)
+    end
+end)
+
 -- Equipment set tetap jalan walau Auto Farm mati, supaya ikut pedang/pickaxe manual.
 S.loadoutThread = task.spawn(function()
     while S.alive do
@@ -3537,6 +4227,11 @@ task.spawn(function()
         pcall(function()
             if S.relicCard then
                 S.relicCard:SetContent(relicStatusText())
+            end
+        end)
+        pcall(function()
+            if S.runCard then
+                S.runCard:SetContent(runStatusText())
             end
         end)
         task.wait(0.5)
