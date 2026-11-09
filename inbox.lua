@@ -16,9 +16,8 @@
     7. Ambil chest otomatis dengan prioritas tertinggi: begitu chest muncul,
        karakter langsung teleport ke chest itu. Kalau state-nya locked, mob
        wave di sekitar chest diserang dulu sampai chest jadi unlocked, lalu
-       chest disentuh supaya terbuka dan hadiahnya diambil. Setelah itu karakter
-       diam di titik chest sampai chest hilang, lalu Auto Farm lanjut mencari
-       batu dari situ.
+       chest disentuh supaya terbuka dan hadiahnya diambil. Begitu hadiah
+       tercatat, karakter langsung lanjut mining tanpa menunggu chest hilang.
     8. Auto pilih relic: relic yang dipilih di tab Relic diutamakan. Kalau
        tidak ada di draft, fallback ke rarity tertinggi. Pilihan dikirim
        lewat StrataNet.PickRelic setelah draft muncul. Draft berbentuk kartu
@@ -145,7 +144,7 @@ local CFG = {
     chestTimeout = 2,          -- batas waktu menyentuh satu chest unlocked
     chestLockTimeout = 40,     -- batas waktu membersihkan wave chest locked
     chestWaveRadius = 240,     -- radius mob wave yang dicari saat chest locked
-    chestOpenHold = 6,         -- maksimal diam di chest open (berhenti lebih awal kalau chest hilang)
+    chestOpenHold = 0.25,      -- kontak singkat di chest open supaya server sempat mencatat hadiah
     chestCooldown = 8,         -- jeda sebelum chest yang gagal dicoba lagi
 
     -- relic
@@ -699,6 +698,13 @@ local function chestAbort(keepPosition)
                 hrp.CFrame = S.chestRestore
             end)
         end
+    elseif keepPosition then
+        -- Karakter tetap di titik chest. Lupakan target rock lama supaya
+        -- mining langsung memilih batu terdekat dari posisi ini.
+        S.rock = nil
+        S.stand = nil
+        S.rockPos = nil
+        S.snappedRock = nil
     end
     S.chestBusy = false
     S.chestTarget = nil
@@ -821,8 +827,9 @@ local function chestStep(hrp, hum)
     local chestDist = flat.Magnitude
 
     if state == "open" then
-        -- Sentuhan terakhir untuk mengambil hadiah; karakter diam di titik chest
-        -- sampai chest hilang (atau batas waktu tercapai).
+        -- Sentuhan terakhir untuk mengambil hadiah. Kontak hanya sebentar
+        -- supaya server sempat mencatat hadiah, lalu karakter langsung lanjut
+        -- mining tanpa menunggu chest hilang.
         if S.chestClaimUntil == 0 then
             pcall(function()
                 hrp.CFrame = CFrame.new(point)
@@ -838,7 +845,7 @@ local function chestStep(hrp, hum)
             end)
             return true
         end
-        -- Chest berhasil diambil: tetap di titik chest, jangan kembali ke posisi lama.
+        -- Hadiah sudah tercatat: lepas chest di posisi sekarang dan lanjut mining.
         chestAbort(true)
         return false
     end
@@ -3215,7 +3222,7 @@ local ChestSection = FarmTab:CreateSection("Chest")
 
 ChestSection:AddToggle({
     Name = "Auto Ambil Chest",
-    Description = "Saat Auto Farm jalan: chest yang muncul langsung didatangi lewat teleport. Kalau masih locked, wave mob dibereskan dulu, lalu chest dibuka dan hadiahnya diambil.",
+    Description = "Saat Auto Farm jalan: chest yang muncul langsung didatangi lewat teleport. Kalau masih locked, wave mob dibereskan dulu, lalu chest dibuka dan hadiahnya diambil. Setelah itu langsung lanjut mining tanpa menunggu chest hilang.",
     Flag = "DelveFarmChest",
     Default = true,
     Callback = function(on)
@@ -3259,8 +3266,9 @@ ChestSection:AddParagraph({
     Content = "Chest dengan ChestRarity dan Owner kosong atau milik sendiri langsung "
         .. "didatangi, baik state-nya locked maupun unlocked. Saat locked, hub "
         .. "menyerang mob wave di sekitar chest sampai state berubah unlocked. "
-        .. "Chest unlocked disentuh lewat teleport supaya terbuka, lalu karakter "
-        .. "diam di titik chest sampai chest hilang dan mining lanjut dari situ.",
+        .. "Chest unlocked disentuh lewat teleport supaya terbuka dan hadiahnya "
+        .. "diambil. Begitu hadiah tercatat, karakter langsung lanjut mining tanpa "
+        .. "menunggu chest hilang.",
 })
 
 local ActionSection = FarmTab:CreateSection("Aksi")
@@ -4104,8 +4112,8 @@ HelpSection:AddParagraph({
         .. "menambang. Chest yang muncul langsung didatangi lewat teleport. "
         .. "Kalau chest masih locked, hub menyerang mob wave di sekitarnya sampai "
         .. "state berubah unlocked, lalu menyentuh chest supaya terbuka. "
-        .. "Setelah hadiah diambil, karakter diam di titik chest sampai chest "
-        .. "hilang, lalu mining lanjut dari sana. "
+        .. "Setelah hadiah diambil, karakter langsung lanjut mining tanpa "
+        .. "menunggu chest hilang. "
         .. "Kalau wave terlalu lama, kurangi Radius Chest atau naikkan "
         .. "Batas Bersihkan Wave di tab Farm.",
 })
