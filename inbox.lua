@@ -289,6 +289,18 @@ local function getSummary()
     return nil
 end
 
+-- Cadangan kalau app.State dan SummaryController tidak terbaca (executor
+-- mobile tertentu): teks "Where" di layar hasil menyebut nama dunia.
+local RUNEND_WORLD_HINTS = {
+    ["DELVE"] = "delve",
+    ["GRASSLANDS"] = "starter_mine",
+    ["SUN FLATS"] = "sun_flats",
+    ["PIRATES COVE"] = "pirates_cove",
+    ["INFERNIA"] = "dragons_peak",
+    ["THE ABYSS"] = "abyss",
+    ["FROSTBITE"] = "frostbite",
+}
+
 local function currentWorldId()
     local app = getApp()
     local area = app and app.State and app.State.aim and app.State.aim.area
@@ -303,6 +315,21 @@ local function currentWorldId()
             return worldId
         end
     end
+
+    local pg = plr:FindFirstChildOfClass("PlayerGui")
+    local runEnd = pg and pg:FindFirstChild("RunEnd")
+    local results = runEnd and runEnd:FindFirstChild("Results")
+    local where = results and results:FindFirstChild("Where")
+    local text = where and where.Text
+    if type(text) == "string" and text ~= "" then
+        local upper = string.upper(text)
+        for hint, id in pairs(RUNEND_WORLD_HINTS) do
+            if string.find(upper, hint, 1, true) then
+                return id
+            end
+        end
+    end
+
     return nil
 end
 
@@ -313,39 +340,55 @@ local function isHubArea()
 end
 
 -- Setelah LeaveRun, server butuh waktu untuk menutup sesi lama. StartSession
--- yang dikirim terlalu cepat ditolak dengan "already in a run", jadi tunggu
--- sampai pemain benar-benar di hub, lalu coba beberapa kali.
+-- yang dikirim terlalu cepat ditolak dengan "already in a run", jadi coba
+-- berulang sampai plate baru muncul. Jangan bergantung pada app.State.aim:
+-- di beberapa executor mobile tabel itu tidak terbaca, dan dulu itulah yang
+-- membuat rerun berhenti di hub.
 local function startWorldRun(worldId, oldPlate)
     if not startSessionRemote or type(worldId) ~= "string" or worldId == "" then
         return false
     end
 
-    local left = false
+    -- Kalau layar hasil masih terbuka dan SummaryController tidak bisa
+    -- dipakai, tutup GUI-nya di client. Kalau tidak, SessionChanged milik
+    -- game akan memanggil Hide() saat sesi baru aktif dan bisa mengirim
+    -- LeaveRun lagi.
+    local pg = plr:FindFirstChildOfClass("PlayerGui")
+    local runEnd = pg and pg:FindFirstChild("RunEnd")
+    if runEnd and runEnd:IsA("ScreenGui") and runEnd.Enabled then
+        pcall(function()
+            runEnd.Enabled = false
+        end)
+    end
+
     local attempts = 0
-    local deadline = os.clock() + 20
+    local deadline = os.clock() + 30
 
     while os.clock() < deadline do
-        if isHubArea() then
-            left = true
-        end
-
-        local area = nil
-        local app = getApp()
-        if app and app.State and app.State.aim then
-            area = app.State.aim.area
-        end
         local plate = workspace:FindFirstChild("StrataPlate")
-
-        -- Plate baru (instance berbeda dari plate run lama) berarti run sudah
-        -- dimulai. Ini juga menangkap rerun yang langsung berpindah tanpa
-        -- sempat mampir ke hub.
-        if plate and plate ~= oldPlate and area and area.isHub ~= true and area.worldId == worldId then
-            return true
+        if plate and plate ~= oldPlate then
+            local app = getApp()
+            local session = app and app.State and app.State.session
+            -- Plate baru saja belum cukup: transisi game bisa membangun
+            -- ulang plate lama tanpa memulai sesi. Kalau app terbaca, tunggu
+            -- session aktif. Kalau app tidak terbaca (executor mobile),
+            -- plate baru adalah satu-satunya bukti yang tersedia.
+            if session
+                and session ~= S.rerunOldSession
+                and session.active ~= false
+            then
+                return true
+            end
+            if not app then
+                return true
+            end
         end
 
-        if left and not plate and attempts < 12 then
+        if attempts < 40 then
             attempts = attempts + 1
-            startSessionRemote:FireServer(worldId)
+            pcall(function()
+                startSessionRemote:FireServer(worldId)
+            end)
         end
 
         task.wait(0.75)
@@ -367,6 +410,97 @@ local function isRunEndVisible()
     local pg = plr:FindFirstChildOfClass("PlayerGui")
     local gui = pg and pg:FindFirstChild("RunEnd")
     return gui ~= nil and gui:IsA("ScreenGui") and gui.Enabled
+end
+
+-- Tombol Again/Hub milik game memakai jalur yang sama dengan layar hasil.
+-- Jangan hanya memanggil SummaryController:Hide(mode) lalu StartSession
+-- manual: di Android/executor mobile Hide tanpa callback sering hanya
+-- menutup sesi lama, jadi pemain mendarat di hub. Menekan tombol Again game
+-- membuat callback StartRun bawaan game yang ikut berjalan.
+local function runEndVerbButton(name)
+    local pg = plr:FindFirstChildOfClass("PlayerGui")
+    local gui = pg and pg:FindFirstChild("RunEnd")
+    if not (gui and gui:IsA("ScreenGui") and gui.Enabled) then
+        return nil
+    end
+
+    local verbs = gui:FindFirstChild("Verbs")
+    local holder = verbs or gui:FindFirstChild("Results")
+    local button = holder and holder:FindFirstChild(name)
+    if not button then
+        button = gui:FindFirstChild(name, true)
+    end
+    if not button then
+        return nil
+    end
+
+    local hit = button:FindFirstChild("Hit")
+    if hit and hit:IsA("GuiButton") then
+        return hit
+    end
+    if button:IsA("GuiButton") then
+        return button
+    end
+    return nil
+end
+
+local function fireRunEndVerb(name)
+    local button = runEndVerbButton(name)
+    if not button then
+        return false
+    end
+    local gui = button:FindFirstAncestorOfClass("ScreenGui")
+
+    local function waitClosed(timeout)
+        if not gui then
+            return true
+        end
+        local deadline = os.clock() + timeout
+        while os.clock() < deadline do
+            local ok, enabled = pcall(function()
+                return gui.Enabled
+            end)
+            if not ok or not enabled then
+                return true
+            end
+            task.wait(0.05)
+        end
+        return false
+    end
+
+    if type(getconnections) == "function" then
+        local ok, conns = pcall(getconnections, button.Activated)
+        if ok and type(conns) == "table" then
+            local fired = false
+            for _, conn in ipairs(conns) do
+                if type(conn) == "table"
+                    and type(conn.Fire) == "function"
+                    and conn.Enabled ~= false
+                then
+                    local okFire = pcall(function()
+                        conn:Fire()
+                    end)
+                    if okFire then
+                        fired = true
+                    end
+                end
+            end
+            if fired then
+                return waitClosed(0.6)
+            end
+        end
+    end
+
+    if type(firesignal) == "function" then
+        local ok = pcall(firesignal, button.Activated)
+        if ok then
+            -- Di sebagian executor firesignal tidak benar-benar memanggil
+            -- koneksi. Baru dianggap berhasil kalau layar hasil tertutup.
+            return waitClosed(0.6)
+        end
+    end
+
+    return false
 end
 
 -- Meter yang tampil di HUD: Delve.metresAt(depth + 1) + metresBase. Kalau
@@ -529,6 +663,13 @@ local S = {
 
     -- keluar run
     lastLeaveAt = 0,
+    lastWorldId = nil,
+    rerunPending = false,
+    rerunAt = 0,
+    rerunSeenAt = 0,
+    rerunOldPlate = nil,
+    rerunOldSession = nil,
+    connRerunGui = nil,
     autoLeaveArmed = false,
     depthLeaveArmed = false,
     depthNow = nil,
@@ -2603,6 +2744,10 @@ local function tick()
         releaseAim()
         return
     end
+    local session = delveSession()
+    if session and type(session.worldId) == "string" and session.worldId ~= "" then
+        S.lastWorldId = session.worldId
+    end
     pumpEquip()
     if chestStep(hrp, hum) then
         return
@@ -2732,6 +2877,9 @@ end
 function api.Stop()
     S.running = false
     S.paused = false
+    S.rerunPending = false
+    S.rerunSeenAt = 0
+    S.rerunOldSession = nil
     S.mode = nil
     S.rock = nil
     S.stand = nil
@@ -3028,10 +3176,46 @@ function api.LeaveRun(mode)
         return false
     end
     S.lastLeaveAt = now
+    if mode == "rerun" then
+        S.rerunPending = true
+        S.rerunAt = now
+        S.rerunSeenAt = 0
+        S.rerunOldPlate = workspace:FindFirstChild("StrataPlate")
+        S.rerunOldSession = delveSession()
+        local pg = plr:FindFirstChildOfClass("PlayerGui")
+        local gui = pg and pg:FindFirstChild("RunEnd")
+        if S.connRerunGui then
+            pcall(function()
+                S.connRerunGui:Disconnect()
+            end)
+            S.connRerunGui = nil
+        end
+        if gui and gui:IsA("ScreenGui") then
+            -- SummaryController bisa menampilkan lagi summary lama selama
+            -- transisi. Kalau GUI itu dibiarkan terbuka, SessionChanged
+            -- memanggil Hide() tanpa mode saat sesi baru aktif dan mengirim
+            -- LeaveRun(nil) -- persis penyebab Rerun mendarat di hub.
+            S.connRerunGui = gui:GetPropertyChangedSignal("Enabled"):Connect(function()
+                if S.rerunPending and gui.Enabled then
+                    pcall(function()
+                        gui.Enabled = false
+                    end)
+                end
+            end)
+        end
+    else
+        S.rerunPending = false
+        S.rerunSeenAt = 0
+    end
 
     -- World harus dibaca sebelum run ditutup, karena area berubah ke hub
-    -- begitu server mengeluarkan pemain.
-    local worldId = currentWorldId()
+    -- begitu server mengeluarkan pemain. S.lastWorldId adalah cadangan kalau
+    -- filtergc/app tidak terbaca di executor mobile.
+    local session = delveSession()
+    if session and type(session.worldId) == "string" and session.worldId ~= "" then
+        S.lastWorldId = session.worldId
+    end
+    local worldId = currentWorldId() or S.lastWorldId
     local oldPlate = workspace:FindFirstChild("StrataPlate")
     local summary = getSummary()
 
@@ -3068,15 +3252,130 @@ function api.LeaveRun(mode)
         if not S.alive then
             return
         end
-        -- SummaryController:Hide adalah jalur tombol Again/Hub: menutup layar
-        -- hasil, memanggil RunEndStage:Leave(), lalu mengirim LeaveRun.
-        -- Di tengah run, tombol LEAVE MINE memakai EndSession: server menutup
-        -- sesi dan membuka layar hasil, baru setelah itu Hide(mode) dipanggil.
-        local usedHide = false
-        if isRunEndVisible() and summary then
-            usedHide = pcall(function()
-                summary:Hide(mode)
+        summary = summary or getSummary()
+
+        local function rerunWorldId()
+            local id = worldId or currentWorldId() or S.lastWorldId
+            if not id and summary and type(summary.lastSummary) == "table" then
+                id = summary.lastSummary.worldId
+            end
+            if type(id) == "string" and id ~= "" then
+                return id
+            end
+            return nil
+        end
+
+        -- Jalur tombol Again game: SummaryController:Hide("rerun", callback)
+        -- lalu callback memanggil MenuController:StartRun. Ini yang dipakai
+        -- game sendiri, jadi tidak bergantung pada StartSession manual.
+        local function startNewRun()
+            if not S.alive or mode ~= "rerun" then
+                return
+            end
+            local id = rerunWorldId()
+            if not id then
+                return
+            end
+
+            local menu = nil
+            local app = getApp()
+            if app and app.Controllers then
+                menu = app.Controllers.MenuController
+            end
+            if menu and type(menu.StartRun) == "function" then
+                pcall(function()
+                    menu:StartRun(id)
+                end)
+            end
+        end
+
+        -- Kalau game sempat mengirim StartSession terlalu cepat (terutama di
+        -- Android yang transisinya lebih lambat), sesi baru tidak pernah
+        -- terbangun dan pemain berhenti di hub. Setelah beberapa detik,
+        -- periksa lagi lalu mulai manual kalau memang belum ada run.
+        local function watchRerunStart()
+            task.spawn(function()
+                local app = getApp()
+                local sawNewRun = false
+                local deadline = os.clock() + 6
+                while os.clock() < deadline do
+                    task.wait(0.25)
+                    local session = delveSession()
+                    local plate = workspace:FindFirstChild("StrataPlate")
+                    if plate and plate ~= oldPlate then
+                        if not app then
+                            sawNewRun = true
+                            break
+                        end
+                        if session
+                            and session ~= S.rerunOldSession
+                            and session.active ~= false
+                        then
+                            sawNewRun = true
+                            break
+                        end
+                    end
+                end
+                if not S.alive or sawNewRun then
+                    return
+                end
+                local id = rerunWorldId()
+                if not id then
+                    return
+                end
+                if startWorldRun(id, oldPlate) then
+                    BPUI:Notify({
+                        Title = "Run",
+                        Content = "Run baru dimulai: " .. id .. ".",
+                        Type = "Success",
+                        Duration = 3,
+                    })
+                else
+                    BPUI:Notify({
+                        Title = "Run",
+                        Content = "Rerun gagal: server belum menerima StartSession.",
+                        Type = "Warning",
+                        Duration = 5,
+                    })
+                end
             end)
+        end
+
+        -- 1. SummaryController:Hide dengan callback yang sama seperti tombol
+        -- Again. Hide tanpa callback hanya menutup sesi lama dan mendarat
+        -- di hub, jadi callback StartRun wajib ikut.
+        local usedHide = false
+        local function hideSummary()
+            if not summary then
+                return false
+            end
+            local ok = pcall(function()
+                summary:Hide(mode, mode == "rerun" and startNewRun or nil)
+            end)
+            if ok then
+                usedHide = true
+            end
+            return ok
+        end
+
+        if isRunEndVisible() and summary then
+            hideSummary()
+        elseif isRunEndVisible() then
+            -- 2. Kalau controller tidak terbaca, tekan tombol Again/Hub
+            -- bawaan game. Paling aman karena callback StartRun ikut jalan.
+            local verb = mode == "rerun" and "Again" or "Hub"
+            if fireRunEndVerb(verb) then
+                BPUI:Notify({
+                    Title = "Run",
+                    Content = mode == "rerun" and "Rerun lewat tombol Again game..." or "Keluar lewat tombol Hub game...",
+                    Type = "Info",
+                    Duration = 3,
+                })
+                if mode == "rerun" then
+                    watchRerunStart()
+                end
+                return
+            end
         elseif endSessionRemote then
             -- Server membatasi EndSession. Kalau layar hasil belum terbuka,
             -- coba lagi beberapa kali sebelum menyerah.
@@ -3093,22 +3392,32 @@ function api.LeaveRun(mode)
                 end
                 task.wait(1)
             end
-            if isRunEndVisible() and summary then
-                usedHide = pcall(function()
-                    summary:Hide(mode)
-                end)
+            if isRunEndVisible() then
+                hideSummary()
             end
         end
 
         if not usedHide then
-            leaveRunRemote:FireServer(mode)
+            pcall(function()
+                leaveRunRemote:FireServer(mode)
+            end)
         end
 
         if mode ~= "rerun" then
             return
         end
 
-        if not worldId then
+        -- Kalau Hide sudah dipanggil dengan callback, callback itu yang
+        -- menjalankan StartRun. Jangan kirim StartSession kedua.
+        if usedHide then
+            if mode == "rerun" then
+                watchRerunStart()
+            end
+            return
+        end
+
+        local id = rerunWorldId()
+        if not id then
             BPUI:Notify({
                 Title = "Run",
                 Content = "Rerun gagal: world run tidak terbaca.",
@@ -3118,10 +3427,10 @@ function api.LeaveRun(mode)
             return
         end
 
-        if startWorldRun(worldId, oldPlate) then
+        if startWorldRun(id, oldPlate) then
             BPUI:Notify({
                 Title = "Run",
-                Content = "Run baru dimulai: " .. worldId .. ".",
+                Content = "Run baru dimulai: " .. id .. ".",
                 Type = "Success",
                 Duration = 3,
             })
@@ -3160,6 +3469,12 @@ function api.Destroy()
             S.connLoadout:Disconnect()
         end)
         S.connLoadout = nil
+    end
+    if S.connRerunGui then
+        pcall(function()
+            S.connRerunGui:Disconnect()
+        end)
+        S.connRerunGui = nil
     end
     if getgenv().DelveFarm == api then
         getgenv().DelveFarm = nil
@@ -3639,12 +3954,13 @@ local LeaveSection = RunTab:CreateSection("Keluar Run")
 
 LeaveSection:AddParagraph({
     Title = "Pilihan Tujuan",
-    Content = "Kalau layar hasil sedang terbuka, tombol di bawah memakai fungsi "
-        .. "SummaryController:Hide milik game (jalur tombol Again/Hub). Kalau "
-        .. "ditekan di tengah run, hub mengirim LeaveRun langsung. Rerun lalu "
-        .. "mengirim StartSession dengan world yang sama setelah server selesai "
-        .. "mengeluarkan pemain dari sesi lama; StartSession yang terlalu cepat "
-        .. "ditolak dan dicoba ulang otomatis.",
+    Content = "Kalau layar hasil sedang terbuka, tombol di bawah menekan tombol "
+        .. "Again/Hub bawaan game. Kalau executor tidak bisa memanggil tombol itu, "
+        .. "hub memakai SummaryController:Hide dengan callback StartRun yang sama "
+        .. "seperti tombol Again, jadi Rerun tidak berhenti di hub. Kalau ditekan "
+        .. "di tengah run, hub mengirim EndSession lalu memakai jalur yang sama. "
+        .. "StartSession manual tetap dipakai sebagai cadangan dan dicoba ulang "
+        .. "sampai server menerima sesi baru.",
 })
 
 LeaveSection:AddButton({
@@ -4480,16 +4796,18 @@ HelpSection:AddParagraph({
 
 HelpSection:AddParagraph({
     Title = "Keluar Run",
-    Content = "Tab Run memakai SummaryController:Hide milik game saat layar hasil terbuka. "
-        .. "Di tengah run, hub mengirim LeaveRun langsung. Rerun tidak berhenti di "
-        .. "LeaveRun: setelah server mengeluarkan pemain, hub mengirim "
-        .. "StartSession(worldId) supaya run baru benar-benar dimulai. Kalau "
-        .. "StartSession ditolak karena sesi lama belum selesai, hub mencoba lagi "
-        .. "selama beberapa detik. Toggle otomatis bekerja saat layar hasil (RunEnd) "
-        .. "terbuka. Auto leave kedalaman memakai angka DEPTH yang sama dengan HUD "
-        .. "dan mengirim LeaveRun di tengah run begitu target meter tercapai. "
-        .. "Ke Hub selalu mematikan Auto Farm lebih dulu; Rerun membiarkan "
-        .. "Auto Farm jalan dan memindai plate baru setelah karakter berpindah.",
+    Content = "Saat layar hasil terbuka, tombol Rerun/Ke Hub memakai tombol Again/Hub "
+        .. "bawaan game kalau executor mendukung getconnections atau firesignal. "
+        .. "Kalau tidak, hub memanggil SummaryController:Hide dengan callback StartRun "
+        .. "yang sama seperti tombol Again, jadi pemain tidak mendarat di hub. "
+        .. "Di tengah run, hub mengirim EndSession lalu memakai jalur yang sama. "
+        .. "StartSession manual tetap menjadi cadangan: dikirim berulang sampai "
+        .. "plate baru muncul, tanpa menunggu app.State.aim terbaca. Toggle otomatis "
+        .. "bekerja saat layar hasil (RunEnd) terbuka. Auto leave kedalaman memakai "
+        .. "angka DEPTH yang sama dengan HUD dan mengirim LeaveRun di tengah run "
+        .. "begitu target meter tercapai. Ke Hub selalu mematikan Auto Farm lebih "
+        .. "dulu; Rerun membiarkan Auto Farm jalan dan memindai plate baru setelah "
+        .. "karakter berpindah.",
 })
 
 HelpSection:AddParagraph({
@@ -4607,6 +4925,51 @@ S.depthThread = task.spawn(function()
             S.depthLeaveArmed = false
         end
         task.wait(0.25)
+    end
+end)
+
+-- Penjaga rerun: jangan biarkan layar hasil lama muncul lagi selama
+-- menunggu sesi baru. Flag dilepas setelah sesi baru aktif ~2 detik, atau
+-- setelah 30 detik kalau server tetap menolak.
+S.rerunThread = task.spawn(function()
+    while S.alive do
+        if S.rerunPending then
+            local now = os.clock()
+            local pg = plr:FindFirstChildOfClass("PlayerGui")
+            local gui = pg and pg:FindFirstChild("RunEnd")
+            if gui and gui:IsA("ScreenGui") and gui.Enabled then
+                pcall(function()
+                    gui.Enabled = false
+                end)
+            end
+
+            local app = getApp()
+            local session = delveSession()
+            local plate = workspace:FindFirstChild("StrataPlate")
+            local newRun = false
+            if app then
+                newRun = session ~= nil
+                    and session ~= S.rerunOldSession
+                    and session.active ~= false
+                    and plate ~= nil
+                    and plate ~= S.rerunOldPlate
+            else
+                newRun = plate ~= nil and plate ~= S.rerunOldPlate
+            end
+            if newRun then
+                if S.rerunSeenAt == 0 then
+                    S.rerunSeenAt = now
+                elseif now - S.rerunSeenAt > 2 then
+                    S.rerunPending = false
+                end
+            else
+                S.rerunSeenAt = 0
+                if now - S.rerunAt > 30 then
+                    S.rerunPending = false
+                end
+            end
+        end
+        task.wait(0.05)
     end
 end)
 
