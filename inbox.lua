@@ -12,7 +12,7 @@
     6. Fly manual (WASD, Space naik, LeftCtrl turun) + hover otomatis di atas
        batu/mob saat Auto Farm jalan. Saat Teleport Langsung aktif, badan
        dipindah seketika ke titik hover, bukan terbang mendekat.
-       Ketinggian hover diatur di tab Terbang.
+       Ketinggian hover diatur di tab Farm > Fly.
     7. Ambil chest otomatis dengan prioritas tertinggi: begitu chest muncul,
        karakter langsung teleport ke chest itu. Kalau state-nya locked, mob
        wave di sekitar chest diserang dulu sampai chest jadi unlocked, lalu
@@ -46,8 +46,8 @@
         chest locked tetap dibersihkan oleh fitur Auto Ambil Chest.
     13. Prioritas batu belakang (Delve): kalau ada batu dengan sel kedalaman
         (sumbu X grid) lebih kecil dari sel pemain, batu itu ditambang dulu
-        sebelum batu yang lebih dekat di depan. Toggle ada di tab Mining >
-        Target Batu.
+        sebelum batu yang lebih dekat di depan. Toggle ada di tab Farm >
+        Auto Farm.
     14. Anti AFK: merespons sinyal Idled Roblox dengan satu klik virtual supaya
         sesi tidak ditendang setelah 20 menit tanpa input. Tidak ada klik
         berkala; toggle-nya ada di tab Farm > Anti AFK.
@@ -100,15 +100,14 @@
 
   Catatan:
     - Auto Farm sengaja mulai dalam keadaan mati. Nyalakan lewat toggle di tab Farm.
-    - Tombol pause memakai keybind BPUI (default F2), bukan RightShift, karena
-      RightShift dipakai BPUI untuk menyembunyikan window.
+    - Pause/Resume tersedia lewat console: getgenv().DelveFarm.Pause() / .Resume().
 ]]
 
 local BPUI_OK, BPUI = pcall(function()
     return loadstring(game:HttpGet("https://raw.githubusercontent.com/bypasshubpremium/BPUINEW/main/BPUI.lua"))()
 end)
 if not BPUI_OK or type(BPUI) ~= "table" then
-    warn("[DelveFarm] gagal memuat BPUI: " .. tostring(BPUI))
+    warn("[DelveFarm] failed to load BPUI: " .. tostring(BPUI))
     return
 end
 
@@ -214,7 +213,6 @@ local CFG = {
     -- swing dari ketinggian
     swingFake = true,          -- kirim titik pukulan di dekat mob, bukan posisi badan
     swingGap = 1.5,            -- jarak titik pukulan dari mob, stud
-    swingDiveAuto = true,      -- otomatis dive kalau 3 swing tidak mengenai mob
     swingDive = false,         -- paksa dive di setiap swing (fallback manual)
     swingDiveTime = 0.28,      -- lama badan berada di titik pukulan
     swingDiveDelay = 0.12,     -- jeda sebelum Swing saat dive, biar posisi sempat replikasi
@@ -226,7 +224,6 @@ local CFG = {
 
 local net = ReplicatedStorage:WaitForChild("StrataNet", 20)
 if not net then
-    BPUI:Notify({ Title = "Delve Hub", Content = "StrataNet tidak ditemukan.", Type = "Error", Duration = 6 })
     return
 end
 
@@ -235,7 +232,6 @@ local pickaxeRemote = net:WaitForChild("PickaxeOut", 10)
 local weaponRemote = net:WaitForChild("WeaponDrawn", 10)
 local swingRemote = net:WaitForChild("Swing", 10)
 if not (aimRemote and pickaxeRemote and weaponRemote and swingRemote) then
-    BPUI:Notify({ Title = "Delve Hub", Content = "Remote StrataNet tidak lengkap.", Type = "Error", Duration = 6 })
     return
 end
 
@@ -285,7 +281,7 @@ local loadoutRemote = net:FindFirstChild("SwapLoadout")
 local profileSyncRemote = net:FindFirstChild("ProfileSync")
 if not loadoutRemote then
     CFG.loadoutAuto = false
-    warn("[DelveFarm] SwapLoadout tidak ditemukan, auto equipment set dimatikan.")
+    warn("[DelveFarm] SwapLoadout not found, auto equipment set disabled.")
 end
 
 -- Keluar run. Remote LeaveRun hanya mengakhiri sesi; run baru dimulai oleh
@@ -294,7 +290,7 @@ local leaveRunRemote = net:FindFirstChild("LeaveRun")
 local endSessionRemote = net:FindFirstChild("EndSession")
 local startSessionRemote = net:FindFirstChild("StartSession")
 if not leaveRunRemote then
-    warn("[DelveFarm] LeaveRun tidak ditemukan, tombol keluar run dimatikan.")
+    warn("[DelveFarm] LeaveRun not found, leave run feature disabled.")
 end
 
 -- Ringkasan run (SummaryController) hanya bisa dipanggil lewat tabel controller
@@ -429,8 +425,8 @@ local function startWorldRun(worldId, oldPlate, oldSession)
     return false
 end
 
-local LEAVE_LABELS = { rerun = "Rerun", hub = "Ke Hub" }
-local LEAVE_KEYS = { ["Rerun"] = "rerun", ["Ke Hub"] = "hub" }
+local LEAVE_LABELS = { rerun = "Rerun", hub = "To Hub" }
+local LEAVE_KEYS = { ["Rerun"] = "rerun", ["To Hub"] = "hub" }
 
 -- StrataPlate hanya ada saat run berjalan. Layar hasil bisa muncul saat plate
 -- sudah hilang, jadi keduanya dipakai untuk memastikan pemain memang di run.
@@ -691,7 +687,6 @@ local S = {
     connChar = nil,
     thread = nil,
     swingCache = nil,
-    keybind = nil,
     toggle = nil,
 
     -- keluar run
@@ -719,7 +714,6 @@ local S = {
     flyTarget = nil,
     flyHeightNow = 0,
     flyToggle = nil,
-    flyKeybind = nil,
     flyCard = nil,
     flyManualAt = 0,
 
@@ -737,11 +731,6 @@ local S = {
     diveUntil = 0,
     divePoint = nil,
     pendingSwing = nil,
-    trackedMob = nil,
-    trackedHp = 0,
-    trackedAt = 0,
-    trackedSwings = 0,
-    forceDive = false,
 
     -- chest
     chestBusy = false,
@@ -1168,7 +1157,7 @@ local function chestStep(hrp, hum)
             S.teleportedAt = now
             S.chestClaimUntil = now + CFG.chestOpenHold
             S.chestTaken = S.chestTaken + 1
-            print("[DelveFarm] chest diambil (" .. tostring(chest:GetAttribute("ChestRarity")) .. ")")
+            print("[DelveFarm] chest collected (" .. tostring(chest:GetAttribute("ChestRarity")) .. ")")
         end
         if now < S.chestClaimUntil then
             pcall(function()
@@ -1255,9 +1244,9 @@ local relicOptions = {}
 local PATH_LABELS = { manual = "Manual", safe = "Safe Path", cursed = "Cursed Path" }
 local TRADER_LABELS = {
     manual = "Manual",
-    priority = "Relic prioritas",
-    relic = "Relic apa saja",
-    cheapest = "Termurah",
+    priority = "Priority relic",
+    relic = "Any relic",
+    cheapest = "Cheapest",
 }
 local TRADER_MODES = { manual = true, priority = true, relic = true, cheapest = true }
 local ASCEND_LABELS = { hollow = "The Hollow", farside = "The Heavens" }
@@ -1854,7 +1843,7 @@ local function onRelicOffer(offer)
         local prefix = isCards and "Kartu: " or "Draft: "
         S.relicStatus = prefix .. table.concat(names, " | ") .. " (" .. tostring(reason) .. ")"
         if isCards and reason ~= "path manual" and reason ~= "trader manual" then
-            print("[DelveFarm] relic: kartu dilewati (" .. tostring(reason) .. ")")
+            print("[DelveFarm] relic: card skipped (" .. tostring(reason) .. ")")
         end
         return
     end
@@ -2122,7 +2111,7 @@ end
 local function loadoutSetLabel(value, allowOff)
     local number_ = loadoutSetNumber(value)
     if number_ == 0 then
-        return allowOff and "Mati" or "Set 1"
+        return allowOff and "Off" or "Set 1"
     end
     return "Set " .. tostring(number_)
 end
@@ -2243,15 +2232,6 @@ local function syncFly(value)
     end
     pcall(function()
         S.flyToggle:Set(value, true)
-    end)
-end
-
-local function syncFlyKey(value)
-    if not S.flyKeybind then
-        return
-    end
-    pcall(function()
-        S.flyKeybind:Set(value, true)
     end)
 end
 
@@ -2734,33 +2714,6 @@ local function mineStep(hrp, hum)
     sendAim(now)
 end
 
-local function mobHealth(mob)
-    local h = mob and mob:FindFirstChildOfClass("Humanoid")
-    return h and h.Health or nil
-end
-
-local function noteSwing(mob, hp, now)
-    if not CFG.swingDiveAuto or not hp then
-        return
-    end
-    if S.trackedMob ~= mob then
-        S.trackedMob = mob
-        S.trackedHp = hp
-        S.trackedAt = now
-        S.trackedSwings = 0
-    end
-    S.trackedSwings = S.trackedSwings + 1
-    if S.trackedSwings >= 5 and now - S.trackedAt >= 2.2 then
-        if hp >= S.trackedHp - 0.01 then
-            S.forceDive = true
-        else
-            S.trackedHp = hp
-            S.trackedAt = now
-            S.trackedSwings = 0
-        end
-    end
-end
-
 function fightStep(mob, hrp, hum)
     local pp = mob.PrimaryPart
     if not pp or not mob.Parent then
@@ -2772,14 +2725,6 @@ function fightStep(mob, hrp, hum)
     local range = weaponStats()
     local now = os.clock()
 
-    if S.trackedMob ~= mob then
-        S.trackedMob = mob
-        S.trackedHp = mobHealth(mob) or 0
-        S.trackedAt = now
-        S.trackedSwings = 0
-        S.forceDive = false
-    end
-
     -- Swing yang tertunda karena dive: baru dikirim setelah posisi turun.
     if S.pendingSwing then
         local p = S.pendingSwing
@@ -2790,7 +2735,6 @@ function fightStep(mob, hrp, hum)
                 pcall(function()
                     swingRemote:FireServer(p.facing, nil, p.point)
                 end)
-                noteSwing(mob, mobHealth(mob), now)
             end
         elseif now > p.at + 0.4 or p.mob ~= mob then
             S.pendingSwing = nil
@@ -2827,7 +2771,7 @@ function fightStep(mob, hrp, hum)
     local facing = flat.Unit
     local point = hrp.Position
     local fakePos = Vector3.new(pos.X - facing.X * CFG.swingGap, pos.Y + 1, pos.Z - facing.Z * CFG.swingGap)
-    local dive = CFG.swingDive or S.forceDive
+    local dive = CFG.swingDive
     local sendPos = CFG.swingFake and fakePos or point
 
     pcall(function()
@@ -2852,7 +2796,6 @@ function fightStep(mob, hrp, hum)
     pcall(function()
         swingRemote:FireServer(facing, nil, sendPos)
     end)
-    noteSwing(mob, mobHealth(mob), now)
 end
 
 local function tick()
@@ -2908,7 +2851,7 @@ local function installGuard()
         end)
     end)
     if not ok then
-        warn("[DelveFarm] hook __namecall gagal: " .. tostring(err))
+        warn("[DelveFarm] hook __namecall failed: " .. tostring(err))
         S.oldNamecall = nil
         return false
     end
@@ -2965,7 +2908,7 @@ local function antiAfkPulse(source)
     if not method then
         if not S.antiAfkWarned then
             S.antiAfkWarned = true
-            warn("[DelveFarm] anti AFK: VirtualUser dan keypress tidak tersedia.")
+            warn("[DelveFarm] anti AFK: VirtualUser and keypress unavailable.")
         end
         return false, "input tidak tersedia"
     end
@@ -3009,15 +2952,6 @@ end
 
 local api = {}
 
-local function syncKeybind(value)
-    if not S.keybind then
-        return
-    end
-    pcall(function()
-        S.keybind:Set(value, true)
-    end)
-end
-
 local function syncToggle(value)
     if not S.toggle then
         return
@@ -3040,9 +2974,6 @@ function api.Start()
     S.rockPos = nil
     S.lastAimSent = 0
     S.warned = false
-    S.forceDive = false
-    S.trackedMob = nil
-    S.trackedSwings = 0
     S.pendingSwing = nil
     S.diveUntil = 0
     S.chestAt = 0
@@ -3058,7 +2989,6 @@ function api.Pause()
     S.paused = true
     releaseAim()
     chestAbort()
-    syncKeybind(true)
 end
 
 function api.Resume()
@@ -3067,7 +2997,6 @@ function api.Resume()
     end
     S.paused = false
     S.mode = nil
-    syncKeybind(false)
 end
 
 function api.Stop()
@@ -3081,12 +3010,9 @@ function api.Stop()
     S.stand = nil
     S.rockPos = nil
     S.pendingSwing = nil
-    S.forceDive = false
-    S.trackedMob = nil
     releaseAim()
     chestAbort()
     uninstallGuard()
-    syncKeybind(false)
     syncToggle(false)
 end
 
@@ -3096,7 +3022,6 @@ function api.SetFly(on)
         if not flyEnable() then
             S.flyOn = false
             syncFly(false)
-            syncFlyKey(false)
             return false
         end
         S.flyOn = true
@@ -3105,7 +3030,6 @@ function api.SetFly(on)
         flyDisable()
     end
     syncFly(S.flyOn)
-    syncFlyKey(S.flyOn)
     return true
 end
 
@@ -3368,32 +3292,14 @@ function api.LeaveRun(mode)
         mode = CFG.leaveMode
     end
     if not leaveRunRemote then
-        BPUI:Notify({
-            Title = "Run",
-            Content = "Remote LeaveRun tidak ditemukan.",
-            Type = "Error",
-            Duration = 4,
-        })
         return false
     end
     if not (isInRun() or isRunEndVisible()) then
-        BPUI:Notify({
-            Title = "Run",
-            Content = "Kamu tidak sedang di dalam run.",
-            Type = "Warning",
-            Duration = 3,
-        })
         return false
     end
 
     local now = os.clock()
     if now - S.lastLeaveAt < CFG.leaveCooldown then
-        BPUI:Notify({
-            Title = "Run",
-            Content = "Tunggu sebentar sebelum mengirim lagi.",
-            Type = "Warning",
-            Duration = 2,
-        })
         return false
     end
     S.lastLeaveAt = now
@@ -3452,20 +3358,10 @@ function api.LeaveRun(mode)
     S.rocksAt = 0
     S.teleportedAt = 0
     S.pendingSwing = nil
-    S.forceDive = false
-    S.trackedMob = nil
-    S.trackedSwings = 0
 
     if mode == "hub" then
         api.Stop()
     end
-
-    BPUI:Notify({
-        Title = "Run",
-        Content = mode == "rerun" and "Rerun: menutup run lama..." or "Keluar run: kembali ke hub...",
-        Type = "Info",
-        Duration = 3,
-    })
 
     task.spawn(function()
         if not S.alive then
@@ -3542,21 +3438,7 @@ function api.LeaveRun(mode)
                 if not id then
                     return
                 end
-                if startWorldRun(id, oldPlate, S.rerunOldSession) then
-                    BPUI:Notify({
-                        Title = "Run",
-                        Content = "Run baru dimulai: " .. id .. ".",
-                        Type = "Success",
-                        Duration = 3,
-                    })
-                else
-                    BPUI:Notify({
-                        Title = "Run",
-                        Content = "Rerun gagal: server belum menerima StartSession.",
-                        Type = "Warning",
-                        Duration = 5,
-                    })
-                end
+                startWorldRun(id, oldPlate, S.rerunOldSession)
             end)
         end
 
@@ -3612,12 +3494,6 @@ function api.LeaveRun(mode)
             if not fireRunEndVerb(verb) then
                 return false
             end
-            BPUI:Notify({
-                Title = "Run",
-                Content = mode == "rerun" and "Rerun lewat tombol Again game..." or "Keluar lewat tombol Hub game...",
-                Type = "Info",
-                Duration = 3,
-            })
             if mode == "rerun" then
                 watchRerunStart()
             end
@@ -3674,30 +3550,10 @@ function api.LeaveRun(mode)
 
         local id = rerunWorldId()
         if not id then
-            BPUI:Notify({
-                Title = "Run",
-                Content = "Rerun gagal: world run tidak terbaca.",
-                Type = "Warning",
-                Duration = 4,
-            })
             return
         end
 
-        if startWorldRun(id, oldPlate, S.rerunOldSession) then
-            BPUI:Notify({
-                Title = "Run",
-                Content = "Run baru dimulai: " .. id .. ".",
-                Type = "Success",
-                Duration = 3,
-            })
-        else
-            BPUI:Notify({
-                Title = "Run",
-                Content = "Rerun gagal: server belum menerima StartSession.",
-                Type = "Warning",
-                Duration = 5,
-            })
-        end
+        startWorldRun(id, oldPlate, S.rerunOldSession)
     end)
 
     return true
@@ -3762,8 +3618,6 @@ S.connChar = plr.CharacterAdded:Connect(function(char)
     S.chasing = false
     S.mob = nil
     S.pendingSwing = nil
-    S.forceDive = false
-    S.trackedMob = nil
     S.diveUntil = 0
     S.divePoint = nil
     S.chestBusy = false
@@ -3885,8 +3739,8 @@ local function statusText()
         lines[#lines + 1] = "Fly: mati"
     end
 
-    if CFG.swingDive or S.forceDive then
-        lines[#lines + 1] = "Swing: dive" .. (S.forceDive and " (auto)" or " (paksa)")
+    if CFG.swingDive then
+        lines[#lines + 1] = "Swing: dive (paksa)"
     elseif CFG.swingFake then
         lines[#lines + 1] = "Swing: titik dekat mob"
     else
@@ -3955,11 +3809,7 @@ local Window = BPUI:CreateWindow({
 
 local FarmTab = Window:CreateTab({ Name = "Farm", Icon = "activity" })
 local RunTab = Window:CreateTab({ Name = "Run", Icon = "rotate-ccw" })
-local MineTab = Window:CreateTab({ Name = "Mining", Icon = "gem" })
-local CombatTab = Window:CreateTab({ Name = "Combat", Icon = "sword" })
-local FlyTab = Window:CreateTab({ Name = "Terbang", Icon = "wind" })
 local RelicTab = Window:CreateTab({ Name = "Relic", Icon = "sparkles" })
-local InfoTab = Window:CreateTab({ Name = "Info", Icon = "info" })
 
 -- ------------------------------------------------------------
 -- Tab Farm
@@ -3971,16 +3821,14 @@ local farmToggle
 
 farmToggle = MainSection:AddToggle({
     Name = "Auto Farm",
-    Description = "Cari batu, teleport, aim, dan lawan mob secara otomatis.",
+    Description = "Finds rocks, teleports, aims, and fights mobs automatically.",
     Flag = "DelveFarmOn",
     Default = false,
     Callback = function(on)
         if on then
             api.Start()
-            BPUI:Notify({ Title = "Delve Hub", Content = "Auto farm dimulai.", Type = "Success", Duration = 3 })
         else
             api.Stop()
-            BPUI:Notify({ Title = "Delve Hub", Content = "Auto farm dihentikan.", Type = "Info", Duration = 3 })
         end
     end,
 })
@@ -3989,7 +3837,7 @@ S.toggle = farmToggle
 
 MainSection:AddToggle({
     Name = "Auto Mining",
-    Description = "Matikan kalau hanya ingin mode lawan mob.",
+    Description = "Turn off if you only want mob combat mode.",
     Flag = "DelveFarmMine",
     Default = true,
     Callback = function(on)
@@ -4003,8 +3851,8 @@ MainSection:AddToggle({
 })
 
 MainSection:AddToggle({
-    Name = "Auto Lawan Mob",
-    Description = "Pindah ke weapon dan swing otomatis saat ada mob dalam radius.",
+    Name = "Auto Fight Mobs",
+    Description = "Switches to the weapon and swings automatically when a mob is within range.",
     Flag = "DelveFarmFight",
     Default = true,
     Callback = function(on)
@@ -4017,8 +3865,8 @@ MainSection:AddToggle({
 })
 
 S.focusToggle = MainSection:AddToggle({
-    Name = "Fokus Mining (Delve)",
-    Description = "Di Delve, mob di room tambang biasa dilewati. Hub hanya menyerang saat room sekarang gate/boss yang wajib dibersihkan untuk membuka tempat berikutnya. Chest locked tetap dibersihkan oleh Auto Ambil Chest.",
+    Name = "Focus Mining (Delve)",
+    Description = "In Delve, mobs in normal mining rooms are skipped. The hub only attacks when the current room is a gate/boss that must be cleared to open the next area. Locked chests are still cleared by Auto Collect Chest.",
     Flag = "DelveFocusMining",
     Default = CFG.focusMining,
     Callback = function(on)
@@ -4028,7 +3876,7 @@ S.focusToggle = MainSection:AddToggle({
 
 MainSection:AddToggle({
     Name = "Auto Equip",
-    Description = "Kirim PickaxeOut / WeaponDrawn sesuai mode yang sedang jalan.",
+    Description = "Sends PickaxeOut / WeaponDrawn based on the current mode.",
     Flag = "DelveFarmEquip",
     Default = true,
     Callback = function(on)
@@ -4036,30 +3884,47 @@ MainSection:AddToggle({
     end,
 })
 
-S.keybind = MainSection:AddKeybind({
-    Name = "Tombol Jeda",
-    Description = "Jeda dan lanjutkan farm. Berbeda dari RightShift milik BPUI.",
-    Flag = "DelveFarmPauseKey",
-    Default = Enum.KeyCode.F2,
-    Mode = "Toggle",
+S.behindToggle = MainSection:AddToggle({
+    Name = "Prioritize Rocks Behind",
+    Description = "In Delve, rocks whose depth cell is lower than the player's cell (toward the shaft entrance) are mined before rocks ahead.",
+    Flag = "DelveBehindFirst",
+    Default = CFG.behindFirst,
     Callback = function(on)
-        if not S.running then
-            syncKeybind(false)
-            return
-        end
-        if on then
-            api.Pause()
-        else
-            api.Resume()
-        end
+        api.SetBehindFirst(on)
+    end,
+})
+
+local FarmFlySection = FarmTab:CreateSection("Fly")
+
+S.flyToggle = FarmFlySection:AddToggle({
+    Name = "Enable Fly",
+    Description = "WASD to move, Space to ascend, LeftCtrl to descend. While Auto Farm is running, hover takes over automatically.",
+    Flag = "DelveFlyOn",
+    Default = false,
+    Callback = function(on)
+        api.SetFly(on)
+    end,
+})
+
+FarmFlySection:AddSlider({
+    Name = "Hover Height",
+    Description = "Body height above the target. If Swing misses, lower it toward weapon range.",
+    Min = 4,
+    Max = 30,
+    Default = 10,
+    Increment = 1,
+    Suffix = " stud",
+    Flag = "DelveHoverHeight",
+    Callback = function(v)
+        CFG.hoverHeight = v
     end,
 })
 
 local EquipmentSection = FarmTab:CreateSection("Equipment Set")
 
 S.loadoutToggle = EquipmentSection:AddToggle({
-    Name = "Auto Ganti Equipment Set",
-    Description = "Pindah loadout otomatis mengikuti pedang dan pickaxe.",
+    Name = "Auto Switch Equipment Set",
+    Description = "Automatically switches loadout based on the sword and pickaxe.",
     Flag = "DelveFarmLoadout",
     Default = CFG.loadoutAuto,
     Callback = function(on)
@@ -4072,8 +3937,8 @@ S.loadoutToggle = EquipmentSection:AddToggle({
 })
 
 S.loadoutCombatDropdown = EquipmentSection:AddDropdown({
-    Name = "Set Saat Pakai Pedang",
-    Description = "Loadout yang dipakai saat pedang terhunus.",
+    Name = "Set When Sword Equipped",
+    Description = "Loadout used while the sword is drawn.",
     Options = { "Set 1", "Set 2", "Set 3" },
     Default = loadoutSetLabel(CFG.loadoutCombat, false),
     Flag = "DelveLoadoutCombat",
@@ -4088,8 +3953,8 @@ S.loadoutCombatDropdown = EquipmentSection:AddDropdown({
 })
 
 S.loadoutMiningDropdown = EquipmentSection:AddDropdown({
-    Name = "Set Saat Mining",
-    Description = "Loadout yang dipakai saat pickaxe keluar.",
+    Name = "Set While Mining",
+    Description = "Loadout used while the pickaxe is out.",
     Options = { "Set 1", "Set 2", "Set 3" },
     Default = loadoutSetLabel(CFG.loadoutMining, false),
     Flag = "DelveLoadoutMining",
@@ -4104,9 +3969,9 @@ S.loadoutMiningDropdown = EquipmentSection:AddDropdown({
 })
 
 S.loadoutIdleDropdown = EquipmentSection:AddDropdown({
-    Name = "Set Saat Diam",
-    Description = "Dipakai saat tidak memegang pedang atau pickaxe. Pilih Mati kalau tidak ingin diganti.",
-    Options = { "Mati", "Set 1", "Set 2", "Set 3" },
+    Name = "Set When Idle",
+    Description = "Used when neither sword nor pickaxe is held. Choose Off to leave it unchanged.",
+    Options = { "Off", "Set 1", "Set 2", "Set 3" },
     Default = loadoutSetLabel(CFG.loadoutIdle, true),
     Flag = "DelveLoadoutIdle",
     Callback = function(value)
@@ -4116,18 +3981,11 @@ S.loadoutIdleDropdown = EquipmentSection:AddDropdown({
     end,
 })
 
-EquipmentSection:AddParagraph({
-    Title = "Cara Pakai",
-    Content = "Pilih set untuk pedang dan mining di atas. Saat pedang terhunus, "
-        .. "karakter otomatis pindah ke set pedang. Saat pickaxe keluar, pindah ke set mining. "
-        .. "Server hanya mengizinkan satu swap setiap 5 detik, jadi perubahan bisa tertunda.",
-})
-
 local AntiAfkSection = FarmTab:CreateSection("Anti AFK")
 
 S.antiAfkToggle = AntiAfkSection:AddToggle({
-    Name = "Aktifkan Anti AFK",
-    Description = "Klik virtual hanya dikirim saat Roblox memicu Idled, jadi tidak ada klik berkala. Tetap jalan walau Auto Farm mati.",
+    Name = "Enable Anti AFK",
+    Description = "A virtual click is only sent when Roblox fires Idled, so there are no periodic clicks. Still runs even when Auto Farm is off.",
     Flag = "DelveAntiAfk",
     Default = CFG.antiAfk,
     Callback = function(on)
@@ -4135,41 +3993,11 @@ S.antiAfkToggle = AntiAfkSection:AddToggle({
     end,
 })
 
-S.antiAfkCard = AntiAfkSection:AddParagraph({
-    Title = "Status Anti AFK",
-    Content = antiAfkStatusText(),
-})
-
-AntiAfkSection:AddButton({
-    Name = "Tes Anti AFK Sekarang",
-    Description = "Kirim satu klik virtual untuk memastikan fitur bekerja.",
-    Callback = function()
-        if not CFG.antiAfk then
-            BPUI:Notify({ Title = "Anti AFK", Content = "Aktifkan toggle Anti AFK dulu.", Type = "Warning", Duration = 3 })
-            return
-        end
-        local ok, method = antiAfkPulse("tes")
-        if ok then
-            BPUI:Notify({ Title = "Anti AFK", Content = "Klik terkirim lewat " .. tostring(method) .. ".", Type = "Success", Duration = 3 })
-        else
-            BPUI:Notify({ Title = "Anti AFK", Content = "Gagal: " .. tostring(method), Type = "Warning", Duration = 4 })
-        end
-    end,
-})
-
-AntiAfkSection:AddParagraph({
-    Title = "Cara Kerja",
-    Content = "Hub hanya mengirim satu klik kanan virtual saat Roblox memicu sinyal Idled, "
-        .. "yaitu beberapa saat sebelum kick 20 menit. Tidak ada timer atau klik berkala, "
-        .. "jadi input game tidak terganggu. Kalau VirtualUser tidak tersedia, hub memakai "
-        .. "tombol W lewat executor. Fitur ini tidak ikut mati saat Auto Farm dijeda atau dihentikan.",
-})
-
 local ChestSection = FarmTab:CreateSection("Chest")
 
 ChestSection:AddToggle({
-    Name = "Auto Ambil Chest",
-    Description = "Saat Auto Farm jalan: chest yang muncul langsung didatangi lewat teleport. Kalau masih locked, wave mob dibereskan dulu, lalu chest dibuka dan hadiahnya diambil. Setelah itu langsung lanjut mining tanpa menunggu chest hilang.",
+    Name = "Auto Collect Chest",
+    Description = "While Auto Farm is running, spawned chests are teleported to immediately. If still locked, mob waves are cleared first, then the chest is opened and its reward collected. After that it goes straight back to mining without waiting for the chest to despawn.",
     Flag = "DelveFarmChest",
     Default = true,
     Callback = function(on)
@@ -4180,128 +4008,15 @@ ChestSection:AddToggle({
     end,
 })
 
-ChestSection:AddSlider({
-    Name = "Radius Chest",
-    Description = "Hanya chest sedekat ini dari badan yang diambil, supaya chest pemain lain tidak terambil.",
-    Min = 40,
-    Max = 400,
-    Default = 200,
-    Increment = 10,
-    Suffix = " stud",
-    Flag = "DelveChestRadius",
-    Callback = function(v)
-        CFG.chestRadius = v
-    end,
-})
-
-ChestSection:AddSlider({
-    Name = "Batas Bersihkan Wave",
-    Description = "Chest locked dilepas kalau wave tidak selesai dalam waktu ini, lalu Auto Farm lanjut menambang.",
-    Min = 10,
-    Max = 120,
-    Default = 40,
-    Increment = 5,
-    Suffix = " detik",
-    Flag = "DelveChestWaveTimeout",
-    Callback = function(v)
-        CFG.chestLockTimeout = v
-    end,
-})
-
-ChestSection:AddParagraph({
-    Title = "Cara Kerja",
-    Content = "Chest dengan ChestRarity dan Owner kosong atau milik sendiri langsung "
-        .. "didatangi, baik state-nya locked maupun unlocked. Saat locked, hub "
-        .. "menyerang mob wave di sekitar chest sampai state berubah unlocked. "
-        .. "Chest unlocked disentuh lewat teleport supaya terbuka dan hadiahnya "
-        .. "diambil. Begitu hadiah tercatat, karakter langsung lanjut mining tanpa "
-        .. "menunggu chest hilang.",
-})
-
-local ActionSection = FarmTab:CreateSection("Aksi")
-
-ActionSection:AddButton({
-    Name = "Jeda / Lanjut",
-    Style = "Default",
-    Callback = function()
-        if not S.running then
-            BPUI:Notify({ Title = "Delve Hub", Content = "Auto farm sedang mati.", Type = "Warning", Duration = 3 })
-            return
-        end
-        if S.paused then
-            api.Resume()
-        else
-            api.Pause()
-        end
-    end,
-})
-
-ActionSection:AddButton({
-    Name = "Lepas Aim Sekarang",
-    Description = "Kirim Aim(0, 0, false) tanpa menghentikan farm.",
-    Callback = function()
-        releaseAim()
-    end,
-})
-
-ActionSection:AddButton({
-    Name = "Hentikan Auto Farm",
-    Style = "Danger",
-    Callback = function()
-        if farmToggle then
-            farmToggle:Set(false)
-        else
-            api.Stop()
-        end
-    end,
-})
-
-local StatusSection = FarmTab:CreateSection("Status")
-
-local statusCard = StatusSection:AddParagraph({
-    Title = "Status",
-    Content = statusText(),
-})
-
 -- ------------------------------------------------------------
 -- Tab Run
 -- ------------------------------------------------------------
 
-local LeaveSection = RunTab:CreateSection("Keluar Run")
-
-LeaveSection:AddParagraph({
-    Title = "Pilihan Tujuan",
-    Content = "Kalau layar hasil sedang terbuka, tombol di bawah menekan tombol "
-        .. "Again/Hub bawaan game. Kalau executor tidak bisa memanggil tombol itu, "
-        .. "hub memakai SummaryController:Hide dengan callback StartRun yang sama "
-        .. "seperti tombol Again, jadi Rerun tidak berhenti di hub. Kalau ditekan "
-        .. "di tengah run, hub mengirim EndSession lalu memakai jalur yang sama. "
-        .. "StartSession manual tetap dipakai sebagai cadangan dan dicoba ulang "
-        .. "sampai server menerima sesi baru.",
-})
-
-LeaveSection:AddButton({
-    Name = "Rerun Sekarang",
-    Style = "Accent",
-    Description = "Tutup run lama lalu mulai run baru dengan world yang sama. Auto Farm tetap berjalan.",
-    Callback = function()
-        api.LeaveRun("rerun")
-    end,
-})
-
-LeaveSection:AddButton({
-    Name = "Ke Hub Sekarang",
-    Description = "Akhiri run (di tengah run sekalipun) dan kembali ke hub. Auto Farm ikut dimatikan.",
-    Callback = function()
-        api.LeaveRun("hub")
-    end,
-})
-
-local AutoLeaveSection = RunTab:CreateSection("Otomatis")
+local AutoLeaveSection = RunTab:CreateSection("Automatic")
 
 S.leaveToggle = AutoLeaveSection:AddToggle({
-    Name = "Keluar Otomatis Saat Run Selesai",
-    Description = "Saat layar hasil (RunEnd) muncul, hub mengirim tujuan di bawah tanpa menunggu tombol ditekan.",
+    Name = "Auto Leave When Run Ends",
+    Description = "When the results screen (RunEnd) appears, the hub sends the destination below without waiting for a button press.",
     Default = CFG.autoLeave,
     Flag = "DelveAutoLeave",
     Callback = function(on)
@@ -4310,9 +4025,9 @@ S.leaveToggle = AutoLeaveSection:AddToggle({
 })
 
 S.leaveDropdown = AutoLeaveSection:AddDropdown({
-    Name = "Tujuan Otomatis",
-    Description = "Dipakai oleh toggle di atas saat run selesai.",
-    Options = { "Rerun", "Ke Hub" },
+    Name = "Auto Destination",
+    Description = "Used by the toggle above when the run ends.",
+    Options = { LEAVE_LABELS.rerun, LEAVE_LABELS.hub },
     Default = LEAVE_LABELS[CFG.leaveMode] or "Rerun",
     Flag = "DelveLeaveMode",
     Callback = function(value)
@@ -4324,31 +4039,12 @@ S.leaveDropdown = AutoLeaveSection:AddDropdown({
     end,
 })
 
-AutoLeaveSection:AddSlider({
-    Name = "Jeda Sebelum Keluar",
-    Description = "Beri waktu sebentar supaya layar hasil sempat terbaca.",
-    Min = 0,
-    Max = 10,
-    Default = CFG.autoLeaveDelay,
-    Increment = 1,
-    Suffix = " detik",
-    Flag = "DelveLeaveDelay",
-    Callback = function(v)
-        CFG.autoLeaveDelay = v
-    end,
-})
-
-S.runCard = AutoLeaveSection:AddParagraph({
-    Title = "Status Run",
-    Content = runStatusText(),
-})
-
-local DepthLeaveSection = RunTab:CreateSection("Auto Leave Kedalaman")
+local DepthLeaveSection = RunTab:CreateSection("Depth Auto Leave")
 
 S.depthToggle = DepthLeaveSection:AddToggle({
-    Name = "Keluar Otomatis di Kedalaman",
-    Description = "Akhiri run di tengah jalan begitu angka DEPTH di HUD mencapai target. "
-        .. "Tujuan keluar mengikuti dropdown di bagian Otomatis.",
+    Name = "Auto Leave at Depth",
+    Description = "Ends the run mid-way once the DEPTH value in the HUD reaches the target. "
+        .. "The exit destination follows the dropdown in Automatic.",
     Default = CFG.depthLeave,
     Flag = "DelveDepthLeave",
     Callback = function(on)
@@ -4357,10 +4053,10 @@ S.depthToggle = DepthLeaveSection:AddToggle({
 })
 
 S.depthInput = DepthLeaveSection:AddInput({
-    Name = "Kedalaman Target",
-    Description = "Ketik angka meter lalu tekan Enter. Nilai ini dibandingkan dengan meter yang tampil di HUD.",
+    Name = "Target Depth",
+    Description = "Type a meter value and press Enter. This value is compared with the meter shown in the HUD.",
     Default = tostring(CFG.depthLeaveAt),
-    Placeholder = "contoh: 500",
+    Placeholder = "e.g. 500",
     Numeric = true,
     Width = 90,
     Flag = "DelveDepthLeaveAt",
@@ -4369,473 +4065,15 @@ S.depthInput = DepthLeaveSection:AddInput({
     end,
 })
 
-S.depthCard = DepthLeaveSection:AddParagraph({
-    Title = "Status Kedalaman",
-    Content = depthStatusText(),
-})
-
--- ------------------------------------------------------------
--- Tab Mining
--- ------------------------------------------------------------
-
-local TargetSection = MineTab:CreateSection("Target Batu")
-
-TargetSection:AddButton({
-    Name = "Teleport ke Batu Terdekat",
-    Style = "Accent",
-    Description = "Sekali jalan ke batu terdekat, tanpa menyalakan Auto Farm. Tombol ini selalu memilih yang terdekat (mengabaikan prioritas batu belakang) dan mengikuti toggle Teleport Langsung.",
-    Callback = function()
-        local ch = plr.Character
-        local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
-        if not hrp then
-            BPUI:Notify({ Title = "Teleport", Content = "Karakter belum siap.", Type = "Warning", Duration = 3 })
-            return
-        end
-        if pickRock(hrp, true) and S.stand then
-            teleportTo(S.stand, S.rockPos)
-            BPUI:Notify({ Title = "Teleport", Content = "Pindah ke batu " .. S.rock.Name .. ".", Type = "Success", Duration = 3 })
-        else
-            BPUI:Notify({ Title = "Teleport", Content = "Tidak ada batu yang bisa dijangkau.", Type = "Warning", Duration = 3 })
-        end
-    end,
-})
-
-TargetSection:AddButton({
-    Name = "Reset Blacklist",
-    Description = "Batu yang sempat dilewati boleh dipilih lagi.",
-    Callback = function()
-        S.blacklist = {}
-        S.rock = nil
-        BPUI:Notify({ Title = "Mining", Content = "Blacklist dibersihkan.", Type = "Info", Duration = 3 })
-    end,
-})
-
-S.behindToggle = TargetSection:AddToggle({
-    Name = "Prioritaskan Batu di Belakang",
-    Description = "Di run Delve, batu yang sel kedalamannya lebih kecil dari sel pemain (arah pintu masuk shaft) ditambang dulu sebelum batu di depan.",
-    Flag = "DelveBehindFirst",
-    Default = CFG.behindFirst,
-    Callback = function(on)
-        api.SetBehindFirst(on)
-    end,
-})
-
-local MiningSection = MineTab:CreateSection("Penempatan")
-
-MiningSection:AddToggle({
-    Name = "Teleport Langsung ke Batu",
-    Description = "Badan dipindah tepat ke sel batu, bukan ke sel di sebelahnya. Saat hover aktif, badan langsung dipindah ke titik hover, bukan terbang mendekat.",
-    Flag = "DelveDirectRock",
-    Default = true,
-    Callback = function(on)
-        CFG.directRock = on
-        S.rock = nil
-        S.stand = nil
-        S.rockPos = nil
-        releaseAim()
-    end,
-})
-
-MiningSection:AddSlider({
-    Name = "Jarak Berdiri dari Batu",
-    Description = "Dipakai kalau Teleport Langsung dimatikan: jarak dari titik tengah batu.",
-    Min = 2,
-    Max = 12,
-    Default = 6,
-    Increment = 0.5,
-    Suffix = " stud",
-    Flag = "DelveStandOffset",
-    Callback = function(v)
-        CFG.standOffset = v
-    end,
-})
-
-MiningSection:AddSlider({
-    Name = "Toleransi Teleport",
-    Description = "Kalau sudah sedekat ini, teleport dilewati.",
-    Min = 0.5,
-    Max = 8,
-    Default = 2.5,
-    Increment = 0.5,
-    Suffix = " stud",
-    Flag = "DelveTeleportTolerance",
-    Callback = function(v)
-        CFG.teleportTolerance = v
-    end,
-})
-
-MiningSection:AddSlider({
-    Name = "Jeda Setelah Mendarat",
-    Min = 0,
-    Max = 1.5,
-    Default = 0.35,
-    Increment = 0.05,
-    Suffix = "s",
-    Flag = "DelveGroundWait",
-    Callback = function(v)
-        CFG.groundWait = v
-    end,
-})
-
-local AimSection = MineTab:CreateSection("Aim")
-
-AimSection:AddSlider({
-    Name = "Kirim Aim per Detik",
-    Description = "Game asli memakai 20. Server menganggap aim basi setelah 0.5 detik.",
-    Min = 5,
-    Max = 30,
-    Default = 20,
-    Increment = 1,
-    Suffix = "/s",
-    Flag = "DelveAimHz",
-    Callback = function(v)
-        CFG.aimHz = v
-    end,
-})
-
-AimSection:AddSlider({
-    Name = "Batas Waktu per Batu",
-    Description = "Batu yang tidak pecah dalam waktu ini dilewati sementara.",
-    Min = 5,
-    Max = 60,
-    Default = 20,
-    Increment = 1,
-    Suffix = "s",
-    Flag = "DelveRockTimeout",
-    Callback = function(v)
-        CFG.rockTimeout = v
-    end,
-})
-
-AimSection:AddSlider({
-    Name = "Lama Blacklist Batu",
-    Min = 5,
-    Max = 120,
-    Default = 20,
-    Increment = 5,
-    Suffix = "s",
-    Flag = "DelveRockBlacklist",
-    Callback = function(v)
-        CFG.rockBlacklist = v
-    end,
-})
-
-AimSection:AddSlider({
-    Name = "Frekuensi Scan Batu",
-    Min = 0.1,
-    Max = 2,
-    Default = 0.5,
-    Increment = 0.1,
-    Suffix = "s",
-    Flag = "DelveRockScan",
-    Callback = function(v)
-        CFG.rockScanInterval = v
-    end,
-})
-
--- ------------------------------------------------------------
--- Tab Combat
--- ------------------------------------------------------------
-
-local MobSection = CombatTab:CreateSection("Deteksi Mob")
-
-MobSection:AddToggle({
-    Name = "Kejar Mob",
-    Description = "Pakai Humanoid MoveTo kalau mob masih di luar jangkauan senjata.",
-    Flag = "DelveFarmChase",
-    Default = true,
-    Callback = function(on)
-        CFG.chase = on
-    end,
-})
-
-MobSection:AddSlider({
-    Name = "Radius Deteksi",
-    Description = "Mulai pakai weapon kalau mob sedekat ini.",
-    Min = 5,
-    Max = 80,
-    Default = 30,
-    Increment = 1,
-    Suffix = " stud",
-    Flag = "DelveMobDetect",
-    Callback = function(v)
-        CFG.mobDetect = v
-    end,
-})
-
-MobSection:AddSlider({
-    Name = "Radius Lepas Target",
-    Description = "Balik ke pickaxe setelah mob lebih jauh dari jarak ini.",
-    Min = 10,
-    Max = 120,
-    Default = 42,
-    Increment = 1,
-    Suffix = " stud",
-    Flag = "DelveMobRelease",
-    Callback = function(v)
-        CFG.mobRelease = v
-    end,
-})
-
-MobSection:AddSlider({
-    Name = "Jarak Berhenti Kejar",
-    Description = "Berhenti mendekat kalau jarak sudah di bawah nilai ini.",
-    Min = 0,
-    Max = 20,
-    Default = 7,
-    Increment = 1,
-    Suffix = " stud",
-    Flag = "DelveChaseStop",
-    Callback = function(v)
-        CFG.chaseStop = v
-    end,
-})
-
-MobSection:AddSlider({
-    Name = "Jeda Scan Mob",
-    Min = 0.1,
-    Max = 1,
-    Default = 0.25,
-    Increment = 0.05,
-    Suffix = "s",
-    Flag = "DelveMobScan",
-    Callback = function(v)
-        CFG.mobScanInterval = v
-    end,
-})
-
--- ------------------------------------------------------------
--- Tab Terbang
--- ------------------------------------------------------------
-
-local FlyMain = FlyTab:CreateSection("Fly Manual")
-
-S.flyToggle = FlyMain:AddToggle({
-    Name = "Aktifkan Fly",
-    Description = "WASD bergerak, Space naik, LeftCtrl turun. Saat Auto Farm jalan, hover otomatis mengambil alih.",
-    Flag = "DelveFlyOn",
-    Default = false,
-    Callback = function(on)
-        api.SetFly(on)
-    end,
-})
-
-S.flyKeybind = FlyMain:AddKeybind({
-    Name = "Tombol Fly",
-    Description = "Toggle cepat tanpa membuka window. Ganti kalau bentrok dengan tombol game.",
-    Flag = "DelveFlyKey",
-    Default = Enum.KeyCode.F,
-    Mode = "Toggle",
-    Callback = function(on)
-        api.SetFly(on)
-    end,
-})
-
-FlyMain:AddSlider({
-    Name = "Kecepatan Horizontal",
-    Min = 10,
-    Max = 150,
-    Default = 60,
-    Increment = 5,
-    Suffix = " stud/s",
-    Flag = "DelveFlySpeed",
-    Callback = function(v)
-        CFG.flySpeed = v
-    end,
-})
-
-FlyMain:AddSlider({
-    Name = "Kecepatan Naik/Turun",
-    Min = 10,
-    Max = 100,
-    Default = 40,
-    Increment = 5,
-    Suffix = " stud/s",
-    Flag = "DelveFlyVert",
-    Callback = function(v)
-        CFG.flyVert = v
-    end,
-})
-
-local HoverSection = FlyTab:CreateSection("Hover Otomatis")
-
-HoverSection:AddToggle({
-    Name = "Hover saat Auto Farm",
-    Description = "Master switch. Kalau mati, Fly hanya bekerja manual.",
-    Flag = "DelveHoverOn",
-    Default = true,
-    Callback = function(on)
-        CFG.hover = on
-    end,
-})
-
-HoverSection:AddToggle({
-    Name = "Hover saat Menambang",
-    Description = "Melayang di atas batu selama mengirim Aim. Matikan kalau mining tidak jalan di ketinggian.",
-    Flag = "DelveHoverMine",
-    Default = true,
-    Callback = function(on)
-        CFG.hoverMine = on
-    end,
-})
-
-HoverSection:AddToggle({
-    Name = "Hover saat Menyerang",
-    Description = "Melayang di atas mob supaya serangan melee-nya tidak sampai kalau jarak vertikal cukup.",
-    Flag = "DelveHoverFight",
-    Default = true,
-    Callback = function(on)
-        CFG.hoverFight = on
-    end,
-})
-
-HoverSection:AddSlider({
-    Name = "Ketinggian Hover",
-    Description = "Tinggi badan di atas target. Kalau Swing meleset, turunkan mendekati jangkauan senjata.",
-    Min = 4,
-    Max = 30,
-    Default = 10,
-    Increment = 1,
-    Suffix = " stud",
-    Flag = "DelveHoverHeight",
-    Callback = function(v)
-        CFG.hoverHeight = v
-    end,
-})
-
-HoverSection:AddSlider({
-    Name = "Geser Horizontal (Combat)",
-    Description = "Supaya badan tidak tepat di atas mob dan arah Swing tetap valid.",
-    Min = 0,
-    Max = 6,
-    Default = 4,
-    Increment = 1,
-    Suffix = " stud",
-    Flag = "DelveHoverOffset",
-    Callback = function(v)
-        CFG.hoverOffset = v
-    end,
-})
-
-HoverSection:AddToggle({
-    Name = "Hover di Atas Batu",
-    Description = "Nyala = tepat di atas batu. Mati = di atas sel tempat berdiri, lebih aman untuk Aim.",
-    Flag = "DelveHoverRock",
-    Default = true,
-    Callback = function(on)
-        CFG.hoverRock = on
-    end,
-})
-
-HoverSection:AddParagraph({
-    Title = "Catatan",
-    Content = "Saat Teleport Langsung aktif, titik hover dicapai seketika, bukan terbang mendekat. "
-        .. "Hover hanya bergerak saat Auto Farm menyala. Kalau menyentuh WASD, kontrol manual menang "
-        .. "sampai tombol dilepas.\n\n"
-        .. "Mob punya jangkauan serangan sendiri. Kalau masih kena, naikkan ketinggian. "
-        .. "Kalau Swing tidak mengenai mob, turunkan sampai masih di dalam jangkauan senjata.",
-})
-
-local SwingSection = FlyTab:CreateSection("Swing dari Ketinggian")
-
-SwingSection:AddToggle({
-    Name = "Posisi Pukulan di Dekat Mob",
-    Description = "Swing mengirim titik di depan mob, bukan posisi badan yang tinggi. Ini yang membuat pedang tetap kena tanpa menurunkan hover.",
-    Flag = "DelveSwingFake",
-    Default = true,
-    Callback = function(on)
-        CFG.swingFake = on
-    end,
-})
-
-SwingSection:AddSlider({
-    Name = "Jarak Titik Pukulan",
-    Description = "Titik pukulan digeser dari tengah mob ke arah player.",
-    Min = 0.5,
-    Max = 4,
-    Default = 1.5,
-    Increment = 0.5,
-    Suffix = " stud",
-    Flag = "DelveSwingGap",
-    Callback = function(v)
-        CFG.swingGap = v
-    end,
-})
-
-SwingSection:AddToggle({
-    Name = "Dive Otomatis",
-    Description = "Kalau 5 swing berturut-turut tidak mengurangi HP mob, karakter turun sebentar ke titik pukulan lalu naik lagi.",
-    Flag = "DelveSwingDiveAuto",
-    Default = true,
-    Callback = function(on)
-        CFG.swingDiveAuto = on
-        if not on then
-            S.forceDive = false
-        end
-    end,
-})
-
-SwingSection:AddToggle({
-    Name = "Paksa Dive Setiap Swing",
-    Description = "Pakai ini kalau posisi pukulan tetap tidak kena. Lebih lambat, tapi hampir pasti masuk.",
-    Flag = "DelveSwingDive",
-    Default = false,
-    Callback = function(on)
-        CFG.swingDive = on
-    end,
-})
-
-SwingSection:AddSlider({
-    Name = "Lama Dive",
-    Description = "Berapa lama badan berada di titik pukulan sebelum naik lagi.",
-    Min = 0.1,
-    Max = 0.6,
-    Default = 0.28,
-    Increment = 0.02,
-    Suffix = "s",
-    Flag = "DelveSwingDiveTime",
-    Callback = function(v)
-        CFG.swingDiveTime = v
-    end,
-})
-
-SwingSection:AddParagraph({
-    Title = "Urutan Kerja",
-    Content = "1. Normal: Swing dikirim dengan titik di dekat mob, badan tetap tinggi.\n"
-        .. "2. Kalau HP mob tidak turun setelah 5 swing, Dive Otomatis aktif untuk mob itu.\n"
-        .. "3. Kalau masih mau paksa, nyalakan Paksa Dive Setiap Swing.\n\n"
-        .. "Tinggi hover tidak perlu diturunkan. Dive hanya terjadi sebentar saat menyerang.",
-})
-
-local FlyControl = FlyTab:CreateSection("Kontrol")
-
-FlyControl:AddParagraph({
-    Title = "Tombol",
-    Content = "W / A / S / D = bergerak mengikuti arah kamera\n"
-        .. "Space = naik\n"
-        .. "LeftCtrl = turun\n"
-        .. "Tombol Fly (default F) = nyala / mati",
-})
-
-FlyControl:AddButton({
-    Name = "Matikan Fly",
-    Description = "Turun dari posisi hover dan kembali ke fisika normal.",
-    Style = "Danger",
-    Callback = function()
-        api.SetFly(false)
-        BPUI:Notify({ Title = "Terbang", Content = "Fly dimatikan.", Type = "Info", Duration = 3 })
-    end,
-})
-
 -- ------------------------------------------------------------
 -- Tab Relic
 -- ------------------------------------------------------------
 
-local RelicAutoSection = RelicTab:CreateSection("Auto Pilih")
+local RelicAutoSection = RelicTab:CreateSection("Auto Pick")
 
 RelicAutoSection:AddToggle({
-    Name = "Auto Pilih Relic",
-    Description = "Saat draft relic muncul, pilihan dikirim otomatis sesuai prioritas.",
+    Name = "Auto Pick Relic",
+    Description = "When a relic draft appears, the choice is sent automatically according to priority.",
     Flag = "DelveRelicAuto",
     Default = CFG.autoRelic,
     Callback = function(on)
@@ -4846,8 +4084,8 @@ RelicAutoSection:AddToggle({
 })
 
 RelicAutoSection:AddToggle({
-    Name = "Fallback Rarity Tertinggi",
-    Description = "Kalau tidak ada relic prioritas di draft, ambil rarity paling tinggi.",
+    Name = "Highest Rarity Fallback",
+    Description = "If no priority relic is in the draft, pick the highest rarity.",
     Flag = "DelveRelicFallback",
     Default = CFG.relicFallback,
     Callback = function(on)
@@ -4858,8 +4096,8 @@ RelicAutoSection:AddToggle({
 })
 
 RelicAutoSection:AddSlider({
-    Name = "Jeda Sebelum Memilih",
-    Description = "Beri waktu sebentar supaya kartu sempat terlihat sebelum dipilih.",
+    Name = "Delay Before Picking",
+    Description = "Give the cards a moment to appear before picking.",
     Min = 0,
     Max = 2,
     Default = CFG.relicDelay,
@@ -4872,21 +4110,11 @@ RelicAutoSection:AddSlider({
     end,
 })
 
-RelicAutoSection:AddParagraph({
-    Title = "Aturan Pilih",
-    Content = "1. Relic yang ada di daftar prioritas selalu menang.\n"
-        .. "2. Kalau beberapa prioritas muncul, diambil rarity tertinggi; kalau sama, urutan pilih kamu yang menang.\n"
-        .. "3. Kalau tidak ada prioritas, fallback mengambil rarity tertinggi di draft.\n"
-        .. "4. Draft berbentuk kartu (shrine relic atau blessing) ikut dipilih otomatis.\n"
-        .. "5. Pilihan path dan pembelian trader diatur di bagian 'Path & Trader' (default manual).\n"
-        .. "6. Cabang Rift (The Hollow / The Heavens) diatur terpisah di bagian 'Auto Ascend'.",
-})
-
 local AscendSection = RelicTab:CreateSection("Auto Ascend")
 
 S.ascendToggle = AscendSection:AddToggle({
     Name = "Auto Ascend",
-    Description = "Saat Heart membuka cabang Rift, hub memilih The Hollow atau The Heavens sesuai dropdown.",
+    Description = "When the Heart opens a Rift branch, the hub picks The Hollow or The Heavens according to the dropdown.",
     Flag = "DelveAscendAuto",
     Default = CFG.autoAscend,
     Callback = function(on)
@@ -4897,8 +4125,8 @@ S.ascendToggle = AscendSection:AddToggle({
 })
 
 S.ascendDropdown = AscendSection:AddDropdown({
-    Name = "Ascend Ke",
-    Description = "Realm yang dipilih saat draft cabang Rift muncul.",
+    Name = "Ascend To",
+    Description = "Realm chosen when a Rift branch draft appears.",
     Options = { ASCEND_LABELS.hollow, ASCEND_LABELS.farside },
     Default = ASCEND_LABELS[CFG.ascendTo],
     Flag = "DelveAscendTo",
@@ -4914,8 +4142,8 @@ S.ascendDropdown = AscendSection:AddDropdown({
 })
 
 AscendSection:AddSlider({
-    Name = "Jeda Sebelum Ascend",
-    Description = "Beri waktu sebentar supaya kartu sempat terlihat sebelum dipilih.",
+    Name = "Delay Before Ascend",
+    Description = "Give the cards a moment to appear before picking.",
     Min = 0,
     Max = 2,
     Default = CFG.ascendDelay,
@@ -4928,20 +4156,12 @@ AscendSection:AddSlider({
     end,
 })
 
-AscendSection:AddParagraph({
-    Title = "Cara Kerja",
-    Content = "Saat Heart di room 50 membuka cabang Rift, game mengirim draft berisi "
-        .. "kartu The Hollow dan The Heavens. Hub memilih kartu yang cocok dengan "
-        .. "dropdown di atas sebelum waktunya habis. Pilihan ini tidak memakai "
-        .. "prioritas relic dan tetap jalan walau Auto Pilih Relic dimatikan.",
-})
-
-local RelicPickSection = RelicTab:CreateSection("Prioritas Relic")
+local RelicPickSection = RelicTab:CreateSection("Relic Priority")
 
 if #relicOptions > 0 then
     S.relicDropdown = RelicPickSection:AddDropdown({
-        Name = "Relic Prioritas",
-        Description = "Pilih satu atau beberapa relic. Ada kotak filter di dalam daftar untuk mencari cepat.",
+        Name = "Priority Relics",
+        Description = "Pick one or more relics. There is a filter box in the list for quick search.",
         Options = relicOptions,
         Multi = true,
         Searchable = true,
@@ -4972,13 +4192,13 @@ if #relicOptions > 0 then
     end
 else
     RelicPickSection:AddParagraph({
-        Title = "Data Relic",
-        Content = "Strata.Defs.Relics tidak bisa dibaca, fitur prioritas tidak tersedia.",
+        Title = "Relic Data",
+        Content = "Strata.Defs.Relics could not be read; the priority feature is unavailable.",
     })
 end
 
 RelicPickSection:AddButton({
-    Name = "Kosongkan Prioritas",
+    Name = "Clear Priority",
     Style = "Danger",
     Callback = function()
         if S.relicDropdown then
@@ -5002,8 +4222,8 @@ local function labelKey(labels, label)
 end
 
 S.pathDropdown = RelicOfferSection:AddDropdown({
-    Name = "Pilihan Path",
-    Description = "Saat gate bercabang, hub memilih SAFE PATH atau CURSED PATH sesuai ini.",
+    Name = "Path Choice",
+    Description = "When a gate branches, the hub picks SAFE PATH or CURSED PATH according to this.",
     Options = { "Manual", "Safe Path", "Cursed Path" },
     Default = PATH_LABELS[CFG.pathPick] or "Manual",
     Flag = "DelvePathPick",
@@ -5020,8 +4240,8 @@ S.pathDropdown = RelicOfferSection:AddDropdown({
 
 S.traderDropdown = RelicOfferSection:AddDropdown({
     Name = "Trader",
-    Description = "Atur item trader mana yang dibeli otomatis. Manual = tidak membeli apa pun.",
-    Options = { "Manual", "Relic prioritas", "Relic apa saja", "Termurah" },
+    Description = "Set which trader items are bought automatically. Manual = buy nothing.",
+    Options = { TRADER_LABELS.manual, TRADER_LABELS.priority, TRADER_LABELS.relic, TRADER_LABELS.cheapest },
     Default = TRADER_LABELS[CFG.traderMode] or "Manual",
     Flag = "DelveTraderMode",
     Callback = function(value)
@@ -5036,8 +4256,8 @@ S.traderDropdown = RelicOfferSection:AddDropdown({
 })
 
 RelicOfferSection:AddSlider({
-    Name = "Batas Harga Trader",
-    Description = "0 = tanpa batas. Item yang lebih mahal dari nilai ini tidak dibeli.",
+    Name = "Trader Price Limit",
+    Description = "0 = no limit. Items more expensive than this value are not bought.",
     Min = 0,
     Max = 5000000,
     Default = CFG.traderMaxPrice,
@@ -5047,129 +4267,6 @@ RelicOfferSection:AddSlider({
         CFG.traderMaxPrice = v
         saveRelicPrefs()
         refreshRelicStatus()
-    end,
-})
-
-RelicOfferSection:AddParagraph({
-    Title = "Catatan",
-    Content = "Path: default Manual. Kalau dipilih, hub langsung menekan kartu yang cocok.\n"
-        .. "Trader 'Relic prioritas' hanya membeli relic yang ada di daftar prioritas. "
-        .. "'Relic apa saja' membeli kartu relic dengan rarity tertinggi. "
-        .. "'Termurah' membeli item termurah yang ada.\n"
-        .. "Item dengan afford = false tidak pernah dibeli, dan semua pembelian tetap "
-        .. "dihitung server.",
-})
-
-local RelicStatusSection = RelicTab:CreateSection("Status")
-
-S.relicCard = RelicStatusSection:AddParagraph({
-    Title = "Status Relic",
-    Content = relicStatusText(),
-})
-
--- ------------------------------------------------------------
--- Tab Info
--- ------------------------------------------------------------
-
-local HelpSection = InfoTab:CreateSection("Cara Pakai")
-
-HelpSection:AddParagraph({
-    Title = "Langkah",
-    Content = "1. Masuk ke sesi Delve sampai dunia dan StrataPlate muncul.\n"
-        .. "2. Buka tab Farm, nyalakan Auto Farm.\n"
-        .. "3. Atur jarak berdiri dan radius mob kalau posisi teleport terasa aneh.\n"
-        .. "4. Buka tab Terbang, nyalakan Fly. Atur ketinggian hover sesuai kebutuhan.\n"
-        .. "5. RightShift menyembunyikan window. Tombol jeda memakai keybind sendiri (default F2).\n"
-        .. "6. Buka tab Run untuk memilih Rerun atau Ke Hub, baik lewat tombol maupun otomatis saat run selesai.\n"
-        .. "7. Di tab Run, bagian Auto Leave Kedalaman bisa mengakhiri run begitu meter DEPTH mencapai target.",
-})
-
-HelpSection:AddParagraph({
-    Title = "Fokus Mining (Delve)",
-    Content = "Di mode Delve, mob di room tambang biasa tidak wajib dibunuh. "
-        .. "Saat toggle aktif, hub tetap menambang dan hanya berpindah ke pedang "
-        .. "ketika room sekarang adalah gate atau boss yang wave-nya harus "
-        .. "dibersihkan untuk membuka tempat berikutnya. Room gate dibaca dari "
-        .. "session.chamber + Delve.kind, jadi toggle ini otomatis ikut naik "
-        .. "gate berikutnya.\n\n"
-        .. "Kalau Auto Ambil Chest menyala dan chest masih locked, wave di "
-        .. "sekitar chest tetap dibersihkan supaya chest bisa dibuka. Matikan "
-        .. "Auto Ambil Chest kalau ingin benar-benar hanya mining dan gate.",
-})
-
-HelpSection:AddParagraph({
-    Title = "Catatan Fly",
-    Content = "Fly memakai BodyVelocity + BodyGyro di HumanoidRootPart, jadi karakter tetap bisa "
-        .. "menambang dan Swing lewat remote. Saat Auto Farm menyala dan toggle hover aktif, "
-        .. "badan otomatis ditarik ke titik di atas batu atau mob. WASD/ Space / LeftCtrl "
-        .. "menimpa hover selama tombol ditahan.\n\n"
-        .. "Kalau mob masih bisa menyerang, naikkan Ketinggian Hover. Kalau Swing meleset, "
-        .. "pakai bagian 'Swing dari Ketinggian' di tab Terbang: posisi pukulan dikirim dekat "
-        .. "mob, dan Dive Otomatis dipakai sebagai fallback. Kalau mining berhenti bekerja "
-        .. "saat melayang, matikan Hover saat Menambang.",
-})
-
-HelpSection:AddParagraph({
-    Title = "Auto Ambil Chest",
-    Content = "Aktif secara default saat Auto Farm jalan dan selalu didahulukan di atas "
-        .. "menambang. Chest yang muncul langsung didatangi lewat teleport. "
-        .. "Kalau chest masih locked, hub menyerang mob wave di sekitarnya sampai "
-        .. "state berubah unlocked, lalu menyentuh chest supaya terbuka. "
-        .. "Setelah hadiah diambil, karakter langsung lanjut mining tanpa "
-        .. "menunggu chest hilang. "
-        .. "Kalau wave terlalu lama, kurangi Radius Chest atau naikkan "
-        .. "Batas Bersihkan Wave di tab Farm.",
-})
-
-HelpSection:AddParagraph({
-    Title = "Keluar Run",
-    Content = "Saat layar hasil terbuka, tombol Rerun/Ke Hub memakai tombol Again/Hub "
-        .. "bawaan game kalau executor mendukung getconnections atau firesignal. "
-        .. "Kalau tidak, hub memanggil SummaryController:Hide dengan callback StartRun "
-        .. "yang sama seperti tombol Again, jadi pemain tidak mendarat di hub. "
-        .. "Di tengah run, hub mengirim EndSession lalu memakai jalur yang sama. "
-        .. "StartSession manual tetap menjadi cadangan: dikirim berulang sampai "
-        .. "plate baru muncul, tanpa menunggu app.State.aim terbaca. Toggle otomatis "
-        .. "bekerja saat layar hasil (RunEnd) terbuka. Auto leave kedalaman memakai "
-        .. "angka DEPTH yang sama dengan HUD dan mengirim LeaveRun di tengah run "
-        .. "begitu target meter tercapai. Ke Hub selalu mematikan Auto Farm lebih "
-        .. "dulu; Rerun membiarkan Auto Farm jalan dan memindai plate baru setelah "
-        .. "karakter berpindah.",
-})
-
-HelpSection:AddParagraph({
-    Title = "Anti AFK",
-    Content = "Anti AFK hanya mengirim satu klik kanan virtual saat Roblox memicu sinyal Idled, "
-        .. "beberapa saat sebelum batas idel 20 menit. Tidak ada timer atau klik berkala. "
-        .. "Fitur ini tetap jalan saat Auto Farm mati atau dijeda. "
-        .. "Kalau executor tidak menyediakan VirtualUser, hub memakai tombol W lewat keypress. "
-        .. "Toggle-nya ada di tab Farm > Anti AFK.",
-})
-
-HelpSection:AddParagraph({
-    Title = "Catatan Protokol",
-    Content = "Aim dikirim terus ke StrataNet.Aim karena server menganggap aim basi setelah 0.5 detik. "
-        .. "Saat mode lawan mob, Aim dilepas dulu lalu WeaponDrawn dan Swing dikirim. "
-        .. "Semua pengiriman remote dibungkus pcall.",
-})
-
-local ConsoleSection = InfoTab:CreateSection("Console")
-
-ConsoleSection:AddButton({
-    Name = "Mulai dari Console",
-    Description = "Sama dengan getgenv().DelveFarm.Start().",
-    Callback = function()
-        api.Start()
-        BPUI:Notify({ Title = "Delve Hub", Content = "Auto farm dimulai.", Type = "Success", Duration = 3 })
-    end,
-})
-
-ConsoleSection:AddButton({
-    Name = "Hentikan dari Console",
-    Description = "Sama dengan getgenv().DelveFarm.Stop().",
-    Callback = function()
-        api.Stop()
-        BPUI:Notify({ Title = "Delve Hub", Content = "Auto farm dihentikan.", Type = "Info", Duration = 3 })
     end,
 })
 
@@ -5230,16 +4327,6 @@ S.depthThread = task.spawn(function()
             if depth and not S.depthLeaveArmed and depth >= CFG.depthLeaveAt then
                 S.depthLeaveArmed = true
                 local mode = CFG.leaveMode
-                BPUI:Notify({
-                    Title = "Run",
-                    Content = string.format(
-                        "Kedalaman %d m tercapai. %s...",
-                        depth,
-                        mode == "rerun" and "Rerun" or "Kembali ke hub"
-                    ),
-                    Type = "Info",
-                    Duration = 4,
-                })
                 task.delay(CFG.depthLeaveDelay, function()
                     if not S.alive or not CFG.depthLeave then
                         S.depthLeaveArmed = false
@@ -5366,33 +4453,4 @@ RunService.RenderStepped:Connect(function(dt)
     end
 end)
 
-task.spawn(function()
-    while S.uiAlive do
-        pcall(function()
-            statusCard:SetContent(statusText())
-        end)
-        pcall(function()
-            if S.relicCard then
-                S.relicCard:SetContent(relicStatusText())
-            end
-        end)
-        pcall(function()
-            if S.runCard then
-                S.runCard:SetContent(runStatusText())
-            end
-        end)
-        pcall(function()
-            if S.depthCard then
-                S.depthCard:SetContent(depthStatusText())
-            end
-        end)
-        pcall(function()
-            if S.antiAfkCard then
-                S.antiAfkCard:SetContent(antiAfkStatusText())
-            end
-        end)
-        task.wait(0.5)
-    end
-end)
-
-print("[DelveFarm] siap. Nyalakan Auto Farm di tab Farm. RightShift = sembunyikan window.")
+print("[DelveFarm] ready. Turn on Auto Farm in the Farm tab. RightShift = hide window.")
