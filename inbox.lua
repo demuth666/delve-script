@@ -40,6 +40,10 @@
         hasil muncul. Auto leave kedalaman memantau angka DEPTH di HUD dan
         mengirim LeaveRun begitu target meter yang dipilih tercapai, tanpa
         menunggu run selesai.
+    12. Fokus mining (Delve): mob di room tambang biasa tidak wajib dibunuh.
+        Saat toggle aktif, hub hanya menyerang mob ketika room sekarang adalah
+        gate/boss yang harus dibersihkan untuk membuka tempat berikutnya. Wave
+        chest locked tetap dibersihkan oleh fitur Auto Ambil Chest.
 
   Catatan protokol (dibaca dari StrataClient.Controllers):
     - MiningInput mengirim StrataNet.Aim:FireServer(x, z, true) lalu Aim(0, 0, false) saat lepas.
@@ -82,6 +86,7 @@
     getgenv().DelveFarm.SetAutoLeave(true/false)
     getgenv().DelveFarm.SetDepthLeave(true/false)
     getgenv().DelveFarm.SetDepthTarget(500)
+    getgenv().DelveFarm.SetFocusMining(true/false)
 
   Catatan:
     - Auto Farm sengaja mulai dalam keadaan mati. Nyalakan lewat toggle di tab Farm.
@@ -115,6 +120,7 @@ local CFG = {
     fight = true,
     autoEquip = true,
     chase = true,
+    focusMining = true,        -- Delve: mob hanya dilawan di room gate/boss
 
     -- mining
     aimHz = 20,                -- sama dengan Config.Mining.AimSendRate
@@ -400,6 +406,84 @@ local function liveDepthMetres()
 end
 
 -- ============================================================
+-- Fokus mining (Delve)
+-- ============================================================
+
+-- Room "gate" wajib dibersihkan dari mob sebelum tempat berikutnya terbuka.
+-- Di room tambang biasa mob hanya gangguan dan tidak perlu dilawan.
+local FOCUS_COMBAT_KINDS = { mob = true, boss = true, milestone = true }
+
+local function delveSession()
+    local app = getApp()
+    local session = app and app.State and app.State.session
+    if type(session) == "table" then
+        return session
+    end
+    return nil
+end
+
+local function delveRoomKind(session)
+    session = session or delveSession()
+    if not session or session.worldId ~= "delve" then
+        return nil
+    end
+    local chamber = tonumber(session.chamber)
+    if not chamber then
+        local depth = tonumber(session.depth)
+        chamber = depth and (math.floor(depth) + 1) or nil
+    end
+    if not chamber or not DelveShared or type(DelveShared.kind) ~= "function" then
+        return nil, chamber
+    end
+    local ok, kind = pcall(DelveShared.kind, math.max(math.floor(chamber), 1))
+    if ok and type(kind) == "string" then
+        return kind, chamber
+    end
+    return nil, chamber
+end
+
+-- true = room sekarang butuh mob dibersihkan (gate/boss), false = boleh fokus mining.
+local function delveNeedsCombat(session)
+    session = session or delveSession()
+    if not session or session.worldId ~= "delve" then
+        return true
+    end
+
+    -- Boss dan milestone selalu wajib. "mob" biasa tidak dipakai sendirian
+    -- karena arena/nest juga mengirim waveKind "mob" padahal opsional.
+    local waveKind = session.waveKind
+    if waveKind == "boss" or waveKind == "milestone" then
+        return true
+    end
+
+    local kind = delveRoomKind(session)
+    if kind then
+        return kind == "gate" or kind == "mob"
+    end
+
+    -- Kalau modul Delve tidak terbaca, pakai wave yang sedang berjalan.
+    return type(waveKind) == "string" and FOCUS_COMBAT_KINDS[waveKind] == true
+end
+
+local function focusMiningActive(session)
+    if not CFG.focusMining then
+        return false
+    end
+    session = session or delveSession()
+    return session ~= nil and session.worldId == "delve"
+end
+
+local function combatWanted(session)
+    if not CFG.fight then
+        return false
+    end
+    if not focusMiningActive(session) then
+        return true
+    end
+    return delveNeedsCombat(session)
+end
+
+-- ============================================================
 -- State
 -- ============================================================
 
@@ -409,6 +493,9 @@ local S = {
     running = false,
     paused = false,
     mode = nil,          -- "mine" atau "fight"
+    focusKind = nil,     -- jenis room Delve terakhir: "ore" / "gate"
+    focusCombat = false, -- hasil terakhir combatWanted()
+    focusToggle = nil,
     want = nil,          -- "pickaxe" atau "weapon"
     wantAt = 0,
     aimX = 0,
@@ -2520,7 +2607,9 @@ local function tick()
     if chestStep(hrp, hum) then
         return
     end
-    if CFG.fight then
+    S.focusKind = delveRoomKind()
+    S.focusCombat = combatWanted()
+    if S.focusCombat then
         local mob = nearestMob(hrp.Position)
         S.mob = mob
         if mob then
@@ -2678,6 +2767,19 @@ end
 
 function api.ToggleFly()
     return api.SetFly(not S.flyOn)
+end
+
+function api.SetFocusMining(on)
+    CFG.focusMining = on and true or false
+    if not CFG.focusMining then
+        S.mob = nil
+    end
+    if S.focusToggle then
+        pcall(function()
+            S.focusToggle:Set(CFG.focusMining, true)
+        end)
+    end
+    return CFG.focusMining
 end
 
 function api.SetLoadoutAuto(on)
@@ -3129,6 +3231,22 @@ local function statusText()
     end
     lines[#lines + 1] = "Mode: " .. mode
 
+    if CFG.focusMining then
+        local session = delveSession()
+        if session and session.worldId == "delve" then
+            local kind = delveRoomKind(session)
+            if delveNeedsCombat(session) then
+                lines[#lines + 1] = "Fokus mining: lawan mob (room " .. (kind or "?") .. ")"
+            else
+                lines[#lines + 1] = "Fokus mining: mob dilewati (room " .. (kind or "?") .. ")"
+            end
+        else
+            lines[#lines + 1] = "Fokus mining: menunggu run Delve"
+        end
+    else
+        lines[#lines + 1] = "Fokus mining: nonaktif"
+    end
+
     if S.rock and S.rock.Parent then
         lines[#lines + 1] = string.format("Target: %s (x=%d, z=%d)", S.rock.Name, S.rockX, S.rockZ)
     else
@@ -3305,6 +3423,16 @@ MainSection:AddToggle({
             S.mode = nil
             S.want = "pickaxe"
         end
+    end,
+})
+
+S.focusToggle = MainSection:AddToggle({
+    Name = "Fokus Mining (Delve)",
+    Description = "Di Delve, mob di room tambang biasa dilewati. Hub hanya menyerang saat room sekarang gate/boss yang wajib dibersihkan untuk membuka tempat berikutnya. Chest locked tetap dibersihkan oleh Auto Ambil Chest.",
+    Flag = "DelveFocusMining",
+    Default = CFG.focusMining,
+    Callback = function(on)
+        api.SetFocusMining(on)
     end,
 })
 
@@ -4311,6 +4439,19 @@ HelpSection:AddParagraph({
         .. "5. RightShift menyembunyikan window. Tombol jeda memakai keybind sendiri (default F2).\n"
         .. "6. Buka tab Run untuk memilih Rerun atau Ke Hub, baik lewat tombol maupun otomatis saat run selesai.\n"
         .. "7. Di tab Run, bagian Auto Leave Kedalaman bisa mengakhiri run begitu meter DEPTH mencapai target.",
+})
+
+HelpSection:AddParagraph({
+    Title = "Fokus Mining (Delve)",
+    Content = "Di mode Delve, mob di room tambang biasa tidak wajib dibunuh. "
+        .. "Saat toggle aktif, hub tetap menambang dan hanya berpindah ke pedang "
+        .. "ketika room sekarang adalah gate atau boss yang wave-nya harus "
+        .. "dibersihkan untuk membuka tempat berikutnya. Room gate dibaca dari "
+        .. "session.chamber + Delve.kind, jadi toggle ini otomatis ikut naik "
+        .. "gate berikutnya.\n\n"
+        .. "Kalau Auto Ambil Chest menyala dan chest masih locked, wave di "
+        .. "sekitar chest tetap dibersihkan supaya chest bisa dibuka. Matikan "
+        .. "Auto Ambil Chest kalau ingin benar-benar hanya mining dan gate.",
 })
 
 HelpSection:AddParagraph({
