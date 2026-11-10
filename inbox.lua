@@ -361,7 +361,7 @@ end
 -- berulang sampai plate baru muncul. Jangan bergantung pada app.State.aim:
 -- di beberapa executor mobile tabel itu tidak terbaca, dan dulu itulah yang
 -- membuat rerun berhenti di hub.
-local function startWorldRun(worldId, oldPlate)
+local function startWorldRun(worldId, oldPlate, oldSession)
     if not startSessionRemote or type(worldId) ~= "string" or worldId == "" then
         return false
     end
@@ -391,7 +391,7 @@ local function startWorldRun(worldId, oldPlate)
             -- session aktif. Kalau app tidak terbaca (executor mobile),
             -- plate baru adalah satu-satunya bukti yang tersedia.
             if session
-                and session ~= S.rerunOldSession
+                and session ~= oldSession
                 and session.active ~= false
             then
                 return true
@@ -685,6 +685,7 @@ local S = {
     rerunPending = false,
     rerunAt = 0,
     rerunSeenAt = 0,
+    rerunGuard = false,
     rerunOldPlate = nil,
     rerunOldSession = nil,
     connRerunGui = nil,
@@ -3285,30 +3286,28 @@ function api.LeaveRun(mode)
         S.rerunSeenAt = 0
         S.rerunOldPlate = workspace:FindFirstChild("StrataPlate")
         S.rerunOldSession = delveSession()
-        local pg = plr:FindFirstChildOfClass("PlayerGui")
-        local gui = pg and pg:FindFirstChild("RunEnd")
         if S.connRerunGui then
             pcall(function()
                 S.connRerunGui:Disconnect()
             end)
             S.connRerunGui = nil
         end
-        if gui and gui:IsA("ScreenGui") then
-            -- SummaryController bisa menampilkan lagi summary lama selama
-            -- transisi. Kalau GUI itu dibiarkan terbuka, SessionChanged
-            -- memanggil Hide() tanpa mode saat sesi baru aktif dan mengirim
-            -- LeaveRun(nil) -- persis penyebab Rerun mendarat di hub.
-            S.connRerunGui = gui:GetPropertyChangedSignal("Enabled"):Connect(function()
-                if S.rerunPending and gui.Enabled then
-                    pcall(function()
-                        gui.Enabled = false
-                    end)
-                end
-            end)
-        end
+        -- Jangan matikan GUI hasil sebelum SummaryController:Hide dipanggil.
+        -- Hide() hanya jalan saat RunEnd.Enabled masih true. Kalau GUI
+        -- dimatikan lebih dulu (guard lama), Hide() tidak melakukan apa-apa:
+        -- LeaveRun tidak terkirim dan rerun berhenti/stuck setelah summary.
+        -- Guard baru dipasang setelah Hide berhasil (lihat startRerunGuard).
+        S.rerunGuard = false
     else
         S.rerunPending = false
         S.rerunSeenAt = 0
+        S.rerunGuard = false
+        if S.connRerunGui then
+            pcall(function()
+                S.connRerunGui:Disconnect()
+            end)
+            S.connRerunGui = nil
+        end
     end
 
     -- World harus dibaca sebelum run ditutup, karena area berubah ke hub
@@ -3426,7 +3425,7 @@ function api.LeaveRun(mode)
                 if not id then
                     return
                 end
-                if startWorldRun(id, oldPlate) then
+                if startWorldRun(id, oldPlate, S.rerunOldSession) then
                     BPUI:Notify({
                         Title = "Run",
                         Content = "Run baru dimulai: " .. id .. ".",
@@ -3447,6 +3446,35 @@ function api.LeaveRun(mode)
         -- 1. SummaryController:Hide dengan callback yang sama seperti tombol
         -- Again. Hide tanpa callback hanya menutup sesi lama dan mendarat
         -- di hub, jadi callback StartRun wajib ikut.
+        --
+        -- Guard GUI baru dipasang SETELAH Hide berhasil. Guard lama dipasang
+        -- sebelum Hide, sehingga RunEnd.Enabled sudah false saat Hide dipanggil;
+        -- Hide() hanya bekerja ketika GUI masih enabled, jadi LeaveRun tidak
+        -- pernah terkirim dan rerun berhenti/stuck setelah summary.
+        local function startRerunGuard()
+            if mode ~= "rerun" then
+                return
+            end
+            S.rerunGuard = true
+            if S.connRerunGui then
+                pcall(function()
+                    S.connRerunGui:Disconnect()
+                end)
+                S.connRerunGui = nil
+            end
+            local pg = plr:FindFirstChildOfClass("PlayerGui")
+            local gui = pg and pg:FindFirstChild("RunEnd")
+            if gui and gui:IsA("ScreenGui") then
+                S.connRerunGui = gui:GetPropertyChangedSignal("Enabled"):Connect(function()
+                    if S.rerunPending and S.rerunGuard and gui.Enabled then
+                        pcall(function()
+                            gui.Enabled = false
+                        end)
+                    end
+                end)
+            end
+        end
+
         local usedHide = false
         local function hideSummary()
             if not summary then
@@ -3457,26 +3485,32 @@ function api.LeaveRun(mode)
             end)
             if ok then
                 usedHide = true
+                startRerunGuard()
             end
             return ok
         end
 
-        if isRunEndVisible() and summary then
-            hideSummary()
-        elseif isRunEndVisible() then
+        local function useRunEndVerb()
+            local verb = mode == "rerun" and "Again" or "Hub"
+            if not fireRunEndVerb(verb) then
+                return false
+            end
+            BPUI:Notify({
+                Title = "Run",
+                Content = mode == "rerun" and "Rerun lewat tombol Again game..." or "Keluar lewat tombol Hub game...",
+                Type = "Info",
+                Duration = 3,
+            })
+            if mode == "rerun" then
+                watchRerunStart()
+            end
+            return true
+        end
+
+        if isRunEndVisible() then
             -- 2. Kalau controller tidak terbaca, tekan tombol Again/Hub
             -- bawaan game. Paling aman karena callback StartRun ikut jalan.
-            local verb = mode == "rerun" and "Again" or "Hub"
-            if fireRunEndVerb(verb) then
-                BPUI:Notify({
-                    Title = "Run",
-                    Content = mode == "rerun" and "Rerun lewat tombol Again game..." or "Keluar lewat tombol Hub game...",
-                    Type = "Info",
-                    Duration = 3,
-                })
-                if mode == "rerun" then
-                    watchRerunStart()
-                end
+            if not hideSummary() and useRunEndVerb() then
                 return
             end
         elseif endSessionRemote then
@@ -3496,7 +3530,9 @@ function api.LeaveRun(mode)
                 task.wait(1)
             end
             if isRunEndVisible() then
-                hideSummary()
+                if not hideSummary() and useRunEndVerb() then
+                    return
+                end
             end
         end
 
@@ -3530,7 +3566,7 @@ function api.LeaveRun(mode)
             return
         end
 
-        if startWorldRun(id, oldPlate) then
+        if startWorldRun(id, oldPlate, S.rerunOldSession) then
             BPUI:Notify({
                 Title = "Run",
                 Content = "Run baru dimulai: " .. id .. ".",
@@ -4996,8 +5032,9 @@ S.leaveThread = task.spawn(function()
 end)
 
 -- Auto leave kedalaman. Dipicu sekali per run: setelah target tercapai,
--- LeaveRun dikirim; flag baru dilepas lagi ketika karakter keluar dari run,
--- jadi rerun berikutnya bisa memicu lagi dari awal.
+-- LeaveRun dikirim; flag baru dilepas lagi ketika karakter keluar dari run
+-- atau kedalaman sudah turun di bawah target (run baru), jadi rerun berikutnya
+-- bisa memicu lagi dari awal.
 S.depthThread = task.spawn(function()
     while S.alive do
         if CFG.depthLeave then
@@ -5030,7 +5067,7 @@ S.depthThread = task.spawn(function()
                         S.depthLeaveArmed = false
                     end
                 end)
-            elseif not depth then
+            elseif not depth or depth < CFG.depthLeaveAt then
                 S.depthLeaveArmed = false
             end
         else
@@ -5048,12 +5085,16 @@ S.rerunThread = task.spawn(function()
     while S.alive do
         if S.rerunPending then
             local now = os.clock()
-            local pg = plr:FindFirstChildOfClass("PlayerGui")
-            local gui = pg and pg:FindFirstChild("RunEnd")
-            if gui and gui:IsA("ScreenGui") and gui.Enabled then
-                pcall(function()
-                    gui.Enabled = false
-                end)
+            -- Guard GUI hanya aktif setelah SummaryController:Hide berhasil.
+            -- Sebelum Hide, RunEnd harus dibiarkan terbuka agar Hide bisa jalan.
+            if S.rerunGuard then
+                local pg = plr:FindFirstChildOfClass("PlayerGui")
+                local gui = pg and pg:FindFirstChild("RunEnd")
+                if gui and gui:IsA("ScreenGui") and gui.Enabled then
+                    pcall(function()
+                        gui.Enabled = false
+                    end)
+                end
             end
 
             local app = getApp()
@@ -5074,11 +5115,28 @@ S.rerunThread = task.spawn(function()
                     S.rerunSeenAt = now
                 elseif now - S.rerunSeenAt > 2 then
                     S.rerunPending = false
+                    S.rerunGuard = false
+                    if S.connRerunGui then
+                        pcall(function()
+                            S.connRerunGui:Disconnect()
+                        end)
+                        S.connRerunGui = nil
+                    end
                 end
             else
                 S.rerunSeenAt = 0
                 if now - S.rerunAt > 30 then
                     S.rerunPending = false
+                    S.rerunGuard = false
+                    if S.connRerunGui then
+                        pcall(function()
+                            S.connRerunGui:Disconnect()
+                        end)
+                        S.connRerunGui = nil
+                    end
+                    -- Biarkan auto leave kedalaman mencoba lagi kalau tadi
+                    -- gagal dan pemain ternyata masih di dalam run.
+                    S.depthLeaveArmed = false
                 end
             end
         end
