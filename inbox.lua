@@ -48,6 +48,9 @@
         (sumbu X grid) lebih kecil dari sel pemain, batu itu ditambang dulu
         sebelum batu yang lebih dekat di depan. Toggle ada di tab Mining >
         Target Batu.
+    14. Anti AFK: merespons sinyal Idled Roblox dengan satu klik virtual supaya
+        sesi tidak ditendang setelah 20 menit tanpa input. Tidak ada klik
+        berkala; toggle-nya ada di tab Farm > Anti AFK.
 
   Catatan protokol (dibaca dari StrataClient.Controllers):
     - MiningInput mengirim StrataNet.Aim:FireServer(x, z, true) lalu Aim(0, 0, false) saat lepas.
@@ -92,6 +95,8 @@
     getgenv().DelveFarm.SetDepthTarget(500)
     getgenv().DelveFarm.SetFocusMining(true/false)
     getgenv().DelveFarm.SetBehindFirst(true/false)
+    getgenv().DelveFarm.SetAntiAfk(true/false)
+    getgenv().DelveFarm.AntiAfkPulse()
 
   Catatan:
     - Auto Farm sengaja mulai dalam keadaan mati. Nyalakan lewat toggle di tab Farm.
@@ -115,6 +120,13 @@ local HttpService = game:GetService("HttpService")
 
 local plr = Players.LocalPlayer
 
+-- VirtualUser dipakai anti AFK. Di beberapa executor service ini tidak bisa
+-- diakses, jadi pemakaiannya selalu dibungkus pcall dan ada fallback keypress.
+local VirtualUser = nil
+pcall(function()
+    VirtualUser = game:GetService("VirtualUser")
+end)
+
 -- ============================================================
 -- Konfigurasi (diubah langsung oleh elemen UI)
 -- ============================================================
@@ -126,6 +138,9 @@ local CFG = {
     autoEquip = true,
     chase = true,
     focusMining = true,        -- Delve: mob hanya dilawan di room gate/boss
+
+    -- anti AFK
+    antiAfk = true,            -- cegah kick idle Roblox lewat sinyal Idled
 
     -- mining
     aimHz = 20,                -- sama dengan Config.Mining.AimSendRate
@@ -707,6 +722,16 @@ local S = {
     flyKeybind = nil,
     flyCard = nil,
     flyManualAt = 0,
+
+    -- anti AFK
+    antiAfkToggle = nil,
+    antiAfkCard = nil,
+    antiAfkCount = 0,
+    antiAfkLast = 0,
+    antiAfkMethod = nil,
+    antiAfkSource = nil,
+    antiAfkWarned = false,
+    connIdled = nil,
 
     -- swing
     diveUntil = 0,
@@ -2902,6 +2927,83 @@ local function uninstallGuard()
 end
 
 -- ============================================================
+-- Anti AFK
+-- ============================================================
+
+-- Kirim satu input kecil supaya timer idle Roblox kembali ke nol. VirtualUser
+-- adalah jalur utama karena tetap bekerja walau window game tidak fokus.
+-- keypress hanya cadangan untuk executor yang tidak menyediakan VirtualUser.
+local function antiAfkClick()
+    if VirtualUser then
+        local ok = pcall(function()
+            VirtualUser:CaptureController()
+            VirtualUser:ClickButton2(Vector2.new(0, 0))
+        end)
+        if ok then
+            return "klik virtual"
+        end
+    end
+    if type(keypress) == "function" and type(keyrelease) == "function" then
+        local ok = pcall(function()
+            keypress(0x57)
+            task.delay(0.06, function()
+                pcall(keyrelease, 0x57)
+            end)
+        end)
+        if ok then
+            return "tombol W"
+        end
+    end
+    return nil
+end
+
+local function antiAfkPulse(source)
+    if not CFG.antiAfk then
+        return false, "nonaktif"
+    end
+    local method = antiAfkClick()
+    if not method then
+        if not S.antiAfkWarned then
+            S.antiAfkWarned = true
+            warn("[DelveFarm] anti AFK: VirtualUser dan keypress tidak tersedia.")
+        end
+        return false, "input tidak tersedia"
+    end
+    S.antiAfkLast = os.clock()
+    S.antiAfkCount = S.antiAfkCount + 1
+    S.antiAfkMethod = method
+    S.antiAfkSource = source
+    return true, method
+end
+
+local function antiAfkStatusText()
+    local lines = {}
+    lines[#lines + 1] = "Anti AFK: " .. (CFG.antiAfk and "aktif" or "mati")
+    lines[#lines + 1] = "Klik: hanya saat Idled / tombol tes"
+    if S.antiAfkCount > 0 then
+        lines[#lines + 1] = string.format(
+            "Klik terakhir: %.0f detik lalu (%s)",
+            math.max(os.clock() - S.antiAfkLast, 0),
+            S.antiAfkMethod or "?"
+        )
+        lines[#lines + 1] = "Total klik: " .. tostring(S.antiAfkCount)
+        if S.antiAfkSource then
+            lines[#lines + 1] = "Pemicu terakhir: " .. tostring(S.antiAfkSource)
+        end
+    else
+        lines[#lines + 1] = "Belum ada klik."
+    end
+    if VirtualUser then
+        lines[#lines + 1] = "Metode: klik VirtualUser"
+    elseif type(keypress) == "function" and type(keyrelease) == "function" then
+        lines[#lines + 1] = "Metode: tombol W executor"
+    else
+        lines[#lines + 1] = "Metode: tidak tersedia"
+    end
+    return table.concat(lines, "\n")
+end
+
+-- ============================================================
 -- API (dipakai UI dan console)
 -- ============================================================
 
@@ -3009,6 +3111,21 @@ end
 
 function api.ToggleFly()
     return api.SetFly(not S.flyOn)
+end
+
+function api.SetAntiAfk(on)
+    on = on and true or false
+    CFG.antiAfk = on
+    if S.antiAfkToggle then
+        pcall(function()
+            S.antiAfkToggle:Set(CFG.antiAfk, true)
+        end)
+    end
+    return CFG.antiAfk
+end
+
+function api.AntiAfkPulse()
+    return antiAfkPulse("manual")
 end
 
 function api.SetFocusMining(on)
@@ -3609,6 +3726,12 @@ function api.Destroy()
         end)
         S.connLoadout = nil
     end
+    if S.connIdled then
+        pcall(function()
+            S.connIdled:Disconnect()
+        end)
+        S.connIdled = nil
+    end
     if S.connRerunGui then
         pcall(function()
             S.connRerunGui:Disconnect()
@@ -3722,6 +3845,19 @@ local function statusText()
         lines[#lines + 1] = "Teleport: langsung ke batu"
     else
         lines[#lines + 1] = "Teleport: sel di sebelah batu"
+    end
+    if CFG.antiAfk then
+        if S.antiAfkCount > 0 then
+            lines[#lines + 1] = string.format(
+                "Anti AFK: aktif (%d klik, terakhir %.0f detik lalu)",
+                S.antiAfkCount,
+                math.max(os.clock() - S.antiAfkLast, 0)
+            )
+        else
+            lines[#lines + 1] = "Anti AFK: aktif (menunggu Idled)"
+        end
+    else
+        lines[#lines + 1] = "Anti AFK: mati"
     end
     if not CFG.chest then
         lines[#lines + 1] = "Auto chest: mati"
@@ -3985,6 +4121,48 @@ EquipmentSection:AddParagraph({
     Content = "Pilih set untuk pedang dan mining di atas. Saat pedang terhunus, "
         .. "karakter otomatis pindah ke set pedang. Saat pickaxe keluar, pindah ke set mining. "
         .. "Server hanya mengizinkan satu swap setiap 5 detik, jadi perubahan bisa tertunda.",
+})
+
+local AntiAfkSection = FarmTab:CreateSection("Anti AFK")
+
+S.antiAfkToggle = AntiAfkSection:AddToggle({
+    Name = "Aktifkan Anti AFK",
+    Description = "Klik virtual hanya dikirim saat Roblox memicu Idled, jadi tidak ada klik berkala. Tetap jalan walau Auto Farm mati.",
+    Flag = "DelveAntiAfk",
+    Default = CFG.antiAfk,
+    Callback = function(on)
+        api.SetAntiAfk(on)
+    end,
+})
+
+S.antiAfkCard = AntiAfkSection:AddParagraph({
+    Title = "Status Anti AFK",
+    Content = antiAfkStatusText(),
+})
+
+AntiAfkSection:AddButton({
+    Name = "Tes Anti AFK Sekarang",
+    Description = "Kirim satu klik virtual untuk memastikan fitur bekerja.",
+    Callback = function()
+        if not CFG.antiAfk then
+            BPUI:Notify({ Title = "Anti AFK", Content = "Aktifkan toggle Anti AFK dulu.", Type = "Warning", Duration = 3 })
+            return
+        end
+        local ok, method = antiAfkPulse("tes")
+        if ok then
+            BPUI:Notify({ Title = "Anti AFK", Content = "Klik terkirim lewat " .. tostring(method) .. ".", Type = "Success", Duration = 3 })
+        else
+            BPUI:Notify({ Title = "Anti AFK", Content = "Gagal: " .. tostring(method), Type = "Warning", Duration = 4 })
+        end
+    end,
+})
+
+AntiAfkSection:AddParagraph({
+    Title = "Cara Kerja",
+    Content = "Hub hanya mengirim satu klik kanan virtual saat Roblox memicu sinyal Idled, "
+        .. "yaitu beberapa saat sebelum kick 20 menit. Tidak ada timer atau klik berkala, "
+        .. "jadi input game tidak terganggu. Kalau VirtualUser tidak tersedia, hub memakai "
+        .. "tombol W lewat executor. Fitur ini tidak ikut mati saat Auto Farm dijeda atau dihentikan.",
 })
 
 local ChestSection = FarmTab:CreateSection("Chest")
@@ -4960,6 +5138,15 @@ HelpSection:AddParagraph({
 })
 
 HelpSection:AddParagraph({
+    Title = "Anti AFK",
+    Content = "Anti AFK hanya mengirim satu klik kanan virtual saat Roblox memicu sinyal Idled, "
+        .. "beberapa saat sebelum batas idel 20 menit. Tidak ada timer atau klik berkala. "
+        .. "Fitur ini tetap jalan saat Auto Farm mati atau dijeda. "
+        .. "Kalau executor tidak menyediakan VirtualUser, hub memakai tombol W lewat keypress. "
+        .. "Toggle-nya ada di tab Farm > Anti AFK.",
+})
+
+HelpSection:AddParagraph({
     Title = "Catatan Protokol",
     Content = "Aim dikirim terus ke StrataNet.Aim karena server menganggap aim basi setelah 0.5 detik. "
         .. "Saat mode lawan mob, Aim dilepas dulu lalu WeaponDrawn dan Swing dikirim. "
@@ -5158,6 +5345,16 @@ S.loadoutThread = task.spawn(function()
     end
 end)
 
+-- Anti AFK memakai jalur standar: hanya bereaksi saat Roblox memicu Idled,
+-- beberapa saat sebelum kick 20 menit. Tidak ada timer berkala, jadi tidak ada
+-- klik yang tidak perlu saat pemain masih aktif.
+S.connIdled = plr.Idled:Connect(function()
+    if not CFG.antiAfk then
+        return
+    end
+    antiAfkPulse("idled")
+end)
+
 RunService.RenderStepped:Connect(function(dt)
     if not S.alive or not S.flyOn then
         return
@@ -5187,6 +5384,11 @@ task.spawn(function()
         pcall(function()
             if S.depthCard then
                 S.depthCard:SetContent(depthStatusText())
+            end
+        end)
+        pcall(function()
+            if S.antiAfkCard then
+                S.antiAfkCard:SetContent(antiAfkStatusText())
             end
         end)
         task.wait(0.5)
