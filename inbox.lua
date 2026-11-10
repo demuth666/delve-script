@@ -44,6 +44,9 @@
         Saat toggle aktif, hub hanya menyerang mob ketika room sekarang adalah
         gate/boss yang harus dibersihkan untuk membuka tempat berikutnya. Wave
         chest locked tetap dibersihkan oleh fitur Auto Ambil Chest.
+    13. Prioritas batu belakang (Delve): kalau ada batu di belakang arah hadap
+        karakter, batu itu ditambang dulu sebelum batu yang lebih dekat di
+        depan. Toggle ada di tab Mining > Target Batu.
 
   Catatan protokol (dibaca dari StrataClient.Controllers):
     - MiningInput mengirim StrataNet.Aim:FireServer(x, z, true) lalu Aim(0, 0, false) saat lepas.
@@ -87,6 +90,7 @@
     getgenv().DelveFarm.SetDepthLeave(true/false)
     getgenv().DelveFarm.SetDepthTarget(500)
     getgenv().DelveFarm.SetFocusMining(true/false)
+    getgenv().DelveFarm.SetBehindFirst(true/false)
 
   Catatan:
     - Auto Farm sengaja mulai dalam keadaan mati. Nyalakan lewat toggle di tab Farm.
@@ -131,6 +135,7 @@ local CFG = {
     rockTimeout = 20,          -- detik sebelum rock dianggap gagal dan di-blacklist
     rockBlacklist = 20,        -- lama rock di-blacklist
     rockScanInterval = 0.5,
+    behindFirst = true,        -- Delve: batu di belakang arah hadap ditambang dulu
 
     -- combat
     mobScanInterval = 0.25,
@@ -630,6 +635,7 @@ local S = {
     focusKind = nil,     -- jenis room Delve terakhir: "ore" / "gate"
     focusCombat = false, -- hasil terakhir combatWanted()
     focusToggle = nil,
+    behindToggle = nil,
     want = nil,          -- "pickaxe" atau "weapon"
     wantAt = 0,
     aimX = 0,
@@ -2473,13 +2479,52 @@ local function standFor(rockModel, hrpPos)
     return Vector3.new(floor.X, floor.Y + 3.2, floor.Z), pivot
 end
 
-local function pickRock(hrp)
+local function flatUnit(v)
+    local flat = Vector3.new(v.X, 0, v.Z)
+    if flat.Magnitude < 0.001 then
+        return nil
+    end
+    return flat.Unit
+end
+
+-- Arah hadap dipakai untuk menentukan batu mana yang ada di belakang pemain.
+-- BodyGyro saat fly mempertahankan rotasi ini, jadi arahnya stabil selama
+-- teleport antar batu.
+local function behindFacing(hrp)
+    local facing = flatUnit(hrp.CFrame.LookVector)
+    if facing then
+        return facing
+    end
+    local cam = workspace.CurrentCamera
+    local look = cam and cam.CFrame.LookVector
+    if look then
+        return flatUnit(look)
+    end
+    return nil
+end
+
+local function behindFirstActive()
+    if not CFG.behindFirst then
+        return false
+    end
+    local session = delveSession()
+    if session and type(session.worldId) == "string" and session.worldId ~= "" then
+        return session.worldId == "delve"
+    end
+    return currentWorldId() == "delve"
+end
+
+local function pickRock(hrp, nearestOnly)
     local now = os.clock()
     if now - S.rocksAt > CFG.rockScanInterval then
         S.rocks = scanRocks()
         S.rocksAt = now
     end
-    local best, bestD, bestStand, bestPivot
+    local facing = (not nearestOnly and behindFirstActive()) and behindFacing(hrp) or nil
+
+    -- Kumpulkan dulu semua kandidat, lalu urutkan: batu di belakang arah hadap
+    -- menang dulu (yang terdekat di antara mereka), baru batu terdekat lainnya.
+    local candidates = {}
     for _, r in ipairs(S.rocks) do
         if r.model.Parent then
             local until_ = S.blacklist[r.model]
@@ -2489,29 +2534,41 @@ local function pickRock(hrp)
                 end)
                 if ok and pivot then
                     local d = (Vector3.new(pivot.X - hrp.Position.X, 0, pivot.Z - hrp.Position.Z)).Magnitude
-                    if not bestD or d < bestD then
-                        local stand, pv = standFor(r.model, hrp.Position)
-                        if stand then
-                            best, bestD, bestStand, bestPivot = r, d, stand, pv
-                        else
-                            S.blacklist[r.model] = now + 5
+                    local behind = false
+                    if facing then
+                        local dir = flatUnit(Vector3.new(pivot.X - hrp.Position.X, 0, pivot.Z - hrp.Position.Z))
+                        if dir and dir:Dot(facing) < -0.05 then
+                            behind = true
                         end
                     end
+                    table.insert(candidates, { rock = r, d = d, behind = behind })
                 end
             end
         end
     end
-    if not best then
-        return false
+
+    table.sort(candidates, function(a, b)
+        if a.behind ~= b.behind then
+            return a.behind
+        end
+        return a.d < b.d
+    end)
+
+    for _, c in ipairs(candidates) do
+        local stand, pv = standFor(c.rock.model, hrp.Position)
+        if stand then
+            S.rock = c.rock.model
+            S.rockX = c.rock.x
+            S.rockZ = c.rock.z
+            S.rockSince = now
+            S.stand = stand
+            S.rockPos = pv
+            S.snappedRock = nil
+            return true
+        end
+        S.blacklist[c.rock.model] = now + 5
     end
-    S.rock = best.model
-    S.rockX = best.x
-    S.rockZ = best.z
-    S.rockSince = now
-    S.stand = bestStand
-    S.rockPos = bestPivot
-    S.snappedRock = nil
-    return true
+    return false
 end
 
 local function enterMine()
@@ -2928,6 +2985,16 @@ function api.SetFocusMining(on)
         end)
     end
     return CFG.focusMining
+end
+
+function api.SetBehindFirst(on)
+    CFG.behindFirst = on and true or false
+    if S.behindToggle then
+        pcall(function()
+            S.behindToggle:Set(CFG.behindFirst, true)
+        end)
+    end
+    return CFG.behindFirst
 end
 
 function api.SetLoadoutAuto(on)
@@ -4066,7 +4133,7 @@ local TargetSection = MineTab:CreateSection("Target Batu")
 TargetSection:AddButton({
     Name = "Teleport ke Batu Terdekat",
     Style = "Accent",
-    Description = "Sekali jalan ke batu terdekat, tanpa menyalakan Auto Farm. Mengikuti toggle Teleport Langsung.",
+    Description = "Sekali jalan ke batu terdekat, tanpa menyalakan Auto Farm. Tombol ini selalu memilih yang terdekat (mengabaikan prioritas batu belakang) dan mengikuti toggle Teleport Langsung.",
     Callback = function()
         local ch = plr.Character
         local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
@@ -4074,7 +4141,7 @@ TargetSection:AddButton({
             BPUI:Notify({ Title = "Teleport", Content = "Karakter belum siap.", Type = "Warning", Duration = 3 })
             return
         end
-        if pickRock(hrp) and S.stand then
+        if pickRock(hrp, true) and S.stand then
             teleportTo(S.stand, S.rockPos)
             BPUI:Notify({ Title = "Teleport", Content = "Pindah ke batu " .. S.rock.Name .. ".", Type = "Success", Duration = 3 })
         else
@@ -4090,6 +4157,16 @@ TargetSection:AddButton({
         S.blacklist = {}
         S.rock = nil
         BPUI:Notify({ Title = "Mining", Content = "Blacklist dibersihkan.", Type = "Info", Duration = 3 })
+    end,
+})
+
+S.behindToggle = TargetSection:AddToggle({
+    Name = "Prioritaskan Batu di Belakang",
+    Description = "Di run Delve, batu yang ada di belakang arah hadap karakter ditambang dulu sebelum batu di depan.",
+    Flag = "DelveBehindFirst",
+    Default = CFG.behindFirst,
+    Callback = function(on)
+        api.SetBehindFirst(on)
     end,
 })
 
