@@ -44,9 +44,10 @@
         Saat toggle aktif, hub hanya menyerang mob ketika room sekarang adalah
         gate/boss yang harus dibersihkan untuk membuka tempat berikutnya. Wave
         chest locked tetap dibersihkan oleh fitur Auto Ambil Chest.
-    13. Prioritas batu belakang (Delve): kalau ada batu di belakang arah hadap
-        karakter, batu itu ditambang dulu sebelum batu yang lebih dekat di
-        depan. Toggle ada di tab Mining > Target Batu.
+    13. Prioritas batu belakang (Delve): kalau ada batu dengan sel kedalaman
+        (sumbu X grid) lebih kecil dari sel pemain, batu itu ditambang dulu
+        sebelum batu yang lebih dekat di depan. Toggle ada di tab Mining >
+        Target Batu.
 
   Catatan protokol (dibaca dari StrataClient.Controllers):
     - MiningInput mengirim StrataNet.Aim:FireServer(x, z, true) lalu Aim(0, 0, false) saat lepas.
@@ -135,7 +136,7 @@ local CFG = {
     rockTimeout = 20,          -- detik sebelum rock dianggap gagal dan di-blacklist
     rockBlacklist = 20,        -- lama rock di-blacklist
     rockScanInterval = 0.5,
-    behindFirst = true,        -- Delve: batu di belakang arah hadap ditambang dulu
+    behindFirst = true,        -- Delve: batu di sel kedalaman belakang ditambang dulu
 
     -- combat
     mobScanInterval = 0.25,
@@ -247,6 +248,17 @@ pcall(function()
     local strata = ReplicatedStorage:FindFirstChild("Strata")
     if strata then
         DelveShared = require(strata.Shared.Delve)
+    end
+end)
+
+-- Grid dipakai untuk membaca sel kedalaman pemain. Di shaft Delve, sel X
+-- adalah arah turun shaft (makin besar = makin dalam), jadi sel X lebih
+-- stabil daripada arah hadap karakter untuk menentukan batu "di belakang".
+local GridShared = nil
+pcall(function()
+    local strata = ReplicatedStorage:FindFirstChild("Strata")
+    if strata then
+        GridShared = require(strata.Shared.Grid)
     end
 end)
 
@@ -2487,7 +2499,26 @@ local function flatUnit(v)
     return flat.Unit
 end
 
--- Arah hadap dipakai untuk menentukan batu mana yang ada di belakang pemain.
+-- Sel kedalaman pemain (sumbu X grid). Di shaft Delve, makin besar sel X =
+-- makin dalam, jadi batu dengan sel X lebih kecil berarti ada di belakang
+-- menuju pintu masuk. Grid.fromWorld memakai plate yang sama dengan game.
+local function playerCellX(hrp)
+    if type(GridShared) ~= "table" or type(GridShared.fromWorld) ~= "function" then
+        return nil
+    end
+    local app = getApp()
+    local plate = app and app.State and (app.State.plate or app.State.area)
+    if type(plate) ~= "table" then
+        return nil
+    end
+    local ok, cx = pcall(GridShared.fromWorld, plate, hrp.Position)
+    if ok and type(cx) == "number" then
+        return cx
+    end
+    return nil
+end
+
+-- Cadangan kalau plate/Grid tidak terbaca: pakai arah hadap karakter.
 -- BodyGyro saat fly mempertahankan rotasi ini, jadi arahnya stabil selama
 -- teleport antar batu.
 local function behindFacing(hrp)
@@ -2520,10 +2551,13 @@ local function pickRock(hrp, nearestOnly)
         S.rocks = scanRocks()
         S.rocksAt = now
     end
-    local facing = (not nearestOnly and behindFirstActive()) and behindFacing(hrp) or nil
+    local useBehind = not nearestOnly and behindFirstActive()
+    local playerX = useBehind and playerCellX(hrp) or nil
+    local facing = useBehind and not playerX and behindFacing(hrp) or nil
 
-    -- Kumpulkan dulu semua kandidat, lalu urutkan: batu di belakang arah hadap
-    -- menang dulu (yang terdekat di antara mereka), baru batu terdekat lainnya.
+    -- Kumpulkan dulu semua kandidat, lalu urutkan: batu di belakang arah
+    -- kedalaman (sel X lebih kecil) menang dulu, yang terdekat di antara
+    -- mereka, baru batu terdekat lainnya.
     local candidates = {}
     for _, r in ipairs(S.rocks) do
         if r.model.Parent then
@@ -2535,7 +2569,9 @@ local function pickRock(hrp, nearestOnly)
                 if ok and pivot then
                     local d = (Vector3.new(pivot.X - hrp.Position.X, 0, pivot.Z - hrp.Position.Z)).Magnitude
                     local behind = false
-                    if facing then
+                    if playerX then
+                        behind = r.x < playerX
+                    elseif facing then
                         local dir = flatUnit(Vector3.new(pivot.X - hrp.Position.X, 0, pivot.Z - hrp.Position.Z))
                         if dir and dir:Dot(facing) < -0.05 then
                             behind = true
@@ -4162,7 +4198,7 @@ TargetSection:AddButton({
 
 S.behindToggle = TargetSection:AddToggle({
     Name = "Prioritaskan Batu di Belakang",
-    Description = "Di run Delve, batu yang ada di belakang arah hadap karakter ditambang dulu sebelum batu di depan.",
+    Description = "Di run Delve, batu yang sel kedalamannya lebih kecil dari sel pemain (arah pintu masuk shaft) ditambang dulu sebelum batu di depan.",
     Flag = "DelveBehindFirst",
     Default = CFG.behindFirst,
     Callback = function(on)
