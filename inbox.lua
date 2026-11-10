@@ -37,7 +37,9 @@
         dengan tombol Again/Hub). Di tengah run, hub mengirim LeaveRun langsung.
         Rerun lalu mengirim StartSession(worldId) setelah server benar-benar
         keluar dari sesi lama. Mode otomatis bisa memilih salah satu saat layar
-        hasil muncul.
+        hasil muncul. Auto leave kedalaman memantau angka DEPTH di HUD dan
+        mengirim LeaveRun begitu target meter yang dipilih tercapai, tanpa
+        menunggu run selesai.
 
   Catatan protokol (dibaca dari StrataClient.Controllers):
     - MiningInput mengirim StrataNet.Aim:FireServer(x, z, true) lalu Aim(0, 0, false) saat lepas.
@@ -59,9 +61,9 @@
       mengakhiri sesi lama; run baru dimulai oleh StrataNet.StartSession(worldId)
       dari MenuController:StartRun. StartSession ditolak server ("already in a
       run") kalau sesi lama belum selesai, jadi harus dikirim setelah hub.
-    - Tombol End Run di HUD memakai StrataNet.EndSession, tetapi remote itu
-      tidak selalu diterima di run tambang biasa; LeaveRun("hub"/"rerun")
-      tetap bisa dipakai di tengah run.
+    - Tombol LEAVE MINE di HUD memakai StrataNet.EndSession. Di tengah run,
+      EndSession yang menutup sesi dan membuka layar hasil; LeaveRun baru
+      dikirim dari layar hasil lewat SummaryController:Hide.
 
   Pemakaian:
     loadstring(readfile("AIBridge/inbox.lua"))()
@@ -78,6 +80,8 @@
     getgenv().DelveFarm.LeaveRun("rerun" / "hub")
     getgenv().DelveFarm.SetLeaveMode("rerun" / "hub")
     getgenv().DelveFarm.SetAutoLeave(true/false)
+    getgenv().DelveFarm.SetDepthLeave(true/false)
+    getgenv().DelveFarm.SetDepthTarget(500)
 
   Catatan:
     - Auto Farm sengaja mulai dalam keadaan mati. Nyalakan lewat toggle di tab Farm.
@@ -164,6 +168,9 @@ local CFG = {
     leaveMode = "rerun",       -- "rerun" / "hub", tujuan tombol otomatis
     autoLeave = false,         -- keluar otomatis saat layar hasil muncul
     autoLeaveDelay = 2,        -- jeda sebelum keluar otomatis, detik
+    depthLeave = false,        -- keluar otomatis saat kedalaman mencapai target
+    depthLeaveAt = 500,        -- target kedalaman, meter (angka DEPTH di HUD)
+    depthLeaveDelay = 0.5,     -- jeda singkat sebelum LeaveRun, detik
     leaveCooldown = 3,         -- jeda minimum antar perintah LeaveRun, detik
 
     -- fly / hover
@@ -222,6 +229,16 @@ pcall(function()
     end
 end)
 
+-- Kedalaman yang tampil di HUD dihitung dari Delve.metresAt(chamber) ditambah
+-- metresBase (prestige). Modulnya dipakai untuk auto leave kedalaman.
+local DelveShared = nil
+pcall(function()
+    local strata = ReplicatedStorage:FindFirstChild("Strata")
+    if strata then
+        DelveShared = require(strata.Shared.Delve)
+    end
+end)
+
 local relicOfferRemote = net:WaitForChild("RelicOffer", 5)
 local relicPickRemote = net:WaitForChild("PickRelic", 5)
 
@@ -236,6 +253,7 @@ end
 -- Keluar run. Remote LeaveRun hanya mengakhiri sesi; run baru dimulai oleh
 -- StartSession (dipakai MenuController:StartRun).
 local leaveRunRemote = net:FindFirstChild("LeaveRun")
+local endSessionRemote = net:FindFirstChild("EndSession")
 local startSessionRemote = net:FindFirstChild("StartSession")
 if not leaveRunRemote then
     warn("[DelveFarm] LeaveRun tidak ditemukan, tombol keluar run dimatikan.")
@@ -345,6 +363,42 @@ local function isRunEndVisible()
     return gui ~= nil and gui:IsA("ScreenGui") and gui.Enabled
 end
 
+-- Meter yang tampil di HUD: Delve.metresAt(depth + 1) + metresBase. Kalau
+-- modul Delve tidak bisa dibaca, teks DepthLine di HUD dipakai sebagai cadangan.
+local function liveDepthMetres()
+    if not isInRun() then
+        return nil
+    end
+    local app = getApp()
+    local session = app and app.State and app.State.session
+    if not session or session.active == false then
+        return nil
+    end
+    local worldId = session.worldId
+    if type(worldId) == "string" and worldId ~= "delve" then
+        return nil
+    end
+
+    local depth = tonumber(session.depth)
+    if depth and DelveShared and type(DelveShared.metresAt) == "function" then
+        local ok, metres = pcall(DelveShared.metresAt, math.floor(depth) + 1)
+        if ok and type(metres) == "number" then
+            return math.floor(metres + (tonumber(session.metresBase) or 0))
+        end
+    end
+
+    local pg = plr:FindFirstChildOfClass("PlayerGui")
+    local hud = pg and pg:FindFirstChild("HUD")
+    local line = hud and hud:FindFirstChild("DepthLine")
+    if line and line:IsA("TextLabel") then
+        local digits = line.Text:match("DEPTH%s*<font[^>]*>([%d,]+)</font>%s*M")
+        if digits then
+            return tonumber((digits:gsub(",", "")))
+        end
+    end
+    return nil
+end
+
 -- ============================================================
 -- State
 -- ============================================================
@@ -389,7 +443,12 @@ local S = {
     -- keluar run
     lastLeaveAt = 0,
     autoLeaveArmed = false,
+    depthLeaveArmed = false,
+    depthNow = nil,
     runCard = nil,
+    depthToggle = nil,
+    depthInput = nil,
+    depthCard = nil,
 
     -- fly
     flyOn = false,
@@ -1651,6 +1710,31 @@ local function grounded(hum)
     return hum.FloorMaterial ~= Enum.Material.Air
 end
 
+local function getEquipControllers()
+    local app = getApp()
+    local controllers = app and app.Controllers
+    if type(controllers) ~= "table" then
+        return nil, nil
+    end
+    return controllers.PickaxeController, controllers.WeaponController
+end
+
+local function controllerEquipped(controller)
+    if type(controller) ~= "table" or type(controller.IsEquipped) ~= "function" then
+        return nil
+    end
+    local ok, value = pcall(controller.IsEquipped, controller)
+    if ok and type(value) == "boolean" then
+        return value
+    end
+    return nil
+end
+
+-- Ganti pickaxe/pedang lewat controller milik game, bukan remote mentah.
+-- Controller yang menyimpan status visual dan urutan remote yang benar; kalau
+-- hanya remote yang dikirim, server bisa sudah memakai pickaxe sementara
+-- karakter masih memegang pedang. Remote langsung hanya dipakai untuk
+-- menyamakan status server ketika controller sudah berada di posisi yang benar.
 local function pumpEquip()
     local ch = plr.Character
     if not ch or not S.want or not CFG.autoEquip then
@@ -1660,26 +1744,56 @@ local function pumpEquip()
     if now - S.wantAt < CFG.equipRetry then
         return
     end
+
+    local pickaxe, weapon = getEquipControllers()
     if S.want == "pickaxe" then
-        if ch:GetAttribute("PickaxeOut") ~= true or ch:GetAttribute("WeaponDrawn") == true then
-            S.wantAt = now
-            pcall(function()
-                pickaxeRemote:FireServer(true)
-            end)
-            pcall(function()
-                weaponRemote:FireServer(false)
-            end)
+        local controllerOn = controllerEquipped(pickaxe)
+        local serverOn = ch:GetAttribute("PickaxeOut") == true
+            and ch:GetAttribute("WeaponDrawn") ~= true
+        if controllerOn == true and serverOn then
+            return
         end
+
+        S.wantAt = now
+        if controllerOn == false and type(pickaxe.SetEquipped) == "function" then
+            local ok = pcall(function()
+                pickaxe:SetEquipped(true)
+            end)
+            if ok then
+                return
+            end
+        end
+
+        pcall(function()
+            weaponRemote:FireServer(false)
+        end)
+        pcall(function()
+            pickaxeRemote:FireServer(true)
+        end)
     else
-        if ch:GetAttribute("WeaponDrawn") ~= true or ch:GetAttribute("PickaxeOut") == true then
-            S.wantAt = now
-            pcall(function()
-                weaponRemote:FireServer(true)
-            end)
-            pcall(function()
-                pickaxeRemote:FireServer(false)
-            end)
+        local controllerOn = controllerEquipped(weapon)
+        local serverOn = ch:GetAttribute("WeaponDrawn") == true
+            and ch:GetAttribute("PickaxeOut") ~= true
+        if controllerOn == true and serverOn then
+            return
         end
+
+        S.wantAt = now
+        if controllerOn == false and type(weapon.SetEquipped) == "function" then
+            local ok = pcall(function()
+                weapon:SetEquipped(true)
+            end)
+            if ok then
+                return
+            end
+        end
+
+        pcall(function()
+            weaponRemote:FireServer(true)
+        end)
+        pcall(function()
+            pickaxeRemote:FireServer(false)
+        end)
     end
 end
 
@@ -2743,6 +2857,41 @@ function api.SetAutoLeave(on)
     return CFG.autoLeave
 end
 
+function api.SetDepthLeave(on)
+    CFG.depthLeave = on and true or false
+    if not CFG.depthLeave then
+        S.depthLeaveArmed = false
+    end
+    if S.depthToggle then
+        pcall(function()
+            S.depthToggle:Set(CFG.depthLeave, true)
+        end)
+    end
+    return CFG.depthLeave
+end
+
+function api.SetDepthTarget(meters)
+    local value = tonumber(meters)
+    if not value then
+        if S.depthInput then
+            pcall(function()
+                S.depthInput:Set(tostring(CFG.depthLeaveAt), true)
+            end)
+        end
+        return false
+    end
+    CFG.depthLeaveAt = math.clamp(math.floor(value + 0.5), 50, 20000)
+    if CFG.depthLeave then
+        S.depthLeaveArmed = false
+    end
+    if S.depthInput then
+        pcall(function()
+            S.depthInput:Set(tostring(CFG.depthLeaveAt), true)
+        end)
+    end
+    return CFG.depthLeaveAt
+end
+
 function api.LeaveRun(mode)
     if type(mode) ~= "string" or not LEAVE_LABELS[mode] then
         mode = CFG.leaveMode
@@ -2819,13 +2968,34 @@ function api.LeaveRun(mode)
         end
         -- SummaryController:Hide adalah jalur tombol Again/Hub: menutup layar
         -- hasil, memanggil RunEndStage:Leave(), lalu mengirim LeaveRun.
-        -- Di tengah run layar hasil belum terbuka, jadi LeaveRun dikirim
-        -- langsung; server mengizinkannya dan mengeluarkan pemain ke hub.
+        -- Di tengah run, tombol LEAVE MINE memakai EndSession: server menutup
+        -- sesi dan membuka layar hasil, baru setelah itu Hide(mode) dipanggil.
         local usedHide = false
         if isRunEndVisible() and summary then
             usedHide = pcall(function()
                 summary:Hide(mode)
             end)
+        elseif endSessionRemote then
+            -- Server membatasi EndSession. Kalau layar hasil belum terbuka,
+            -- coba lagi beberapa kali sebelum menyerah.
+            for _ = 1, 3 do
+                pcall(function()
+                    endSessionRemote:FireServer()
+                end)
+                local deadline = os.clock() + 3
+                while S.alive and os.clock() < deadline and not isRunEndVisible() do
+                    task.wait(0.25)
+                end
+                if isRunEndVisible() then
+                    break
+                end
+                task.wait(1)
+            end
+            if isRunEndVisible() and summary then
+                usedHide = pcall(function()
+                    summary:Hide(mode)
+                end)
+            end
         end
 
         if not usedHide then
@@ -3034,12 +3204,29 @@ local function runStatusText()
     else
         lines[#lines + 1] = "Layar hasil: tertutup"
     end
+    local depth = liveDepthMetres()
+    lines[#lines + 1] = "Kedalaman: " .. (depth and (tostring(depth) .. " m") or "-")
+    lines[#lines + 1] = "Batas kedalaman: "
+        .. (CFG.depthLeave and (tostring(CFG.depthLeaveAt) .. " m") or "mati")
     lines[#lines + 1] = "Posisi: " .. (isInRun() and "di dalam run" or "di hub")
     if S.lastLeaveAt > 0 then
         local ago = os.clock() - S.lastLeaveAt
         if ago < 60 then
             lines[#lines + 1] = string.format("Keluar terakhir: %.0f detik lalu", ago)
         end
+    end
+    return table.concat(lines, "\n")
+end
+
+local function depthStatusText()
+    local lines = {}
+    local depth = liveDepthMetres()
+    lines[#lines + 1] = "Kedalaman sekarang: " .. (depth and (tostring(depth) .. " m") or "-")
+    lines[#lines + 1] = "Target: " .. tostring(CFG.depthLeaveAt) .. " m"
+    lines[#lines + 1] = "Auto: " .. (CFG.depthLeave and "aktif" or "mati")
+    lines[#lines + 1] = "Tujuan: " .. (LEAVE_LABELS[CFG.leaveMode] or "Rerun")
+    if CFG.depthLeave and depth and depth >= CFG.depthLeaveAt then
+        lines[#lines + 1] = "Status: target tercapai, menunggu keluar"
     end
     return table.concat(lines, "\n")
 end
@@ -3393,6 +3580,37 @@ AutoLeaveSection:AddSlider({
 S.runCard = AutoLeaveSection:AddParagraph({
     Title = "Status Run",
     Content = runStatusText(),
+})
+
+local DepthLeaveSection = RunTab:CreateSection("Auto Leave Kedalaman")
+
+S.depthToggle = DepthLeaveSection:AddToggle({
+    Name = "Keluar Otomatis di Kedalaman",
+    Description = "Akhiri run di tengah jalan begitu angka DEPTH di HUD mencapai target. "
+        .. "Tujuan keluar mengikuti dropdown di bagian Otomatis.",
+    Default = CFG.depthLeave,
+    Flag = "DelveDepthLeave",
+    Callback = function(on)
+        api.SetDepthLeave(on)
+    end,
+})
+
+S.depthInput = DepthLeaveSection:AddInput({
+    Name = "Kedalaman Target",
+    Description = "Ketik angka meter lalu tekan Enter. Nilai ini dibandingkan dengan meter yang tampil di HUD.",
+    Default = tostring(CFG.depthLeaveAt),
+    Placeholder = "contoh: 500",
+    Numeric = true,
+    Width = 90,
+    Flag = "DelveDepthLeaveAt",
+    Callback = function(text)
+        api.SetDepthTarget(text)
+    end,
+})
+
+S.depthCard = DepthLeaveSection:AddParagraph({
+    Title = "Status Kedalaman",
+    Content = depthStatusText(),
 })
 
 -- ------------------------------------------------------------
@@ -4091,7 +4309,8 @@ HelpSection:AddParagraph({
         .. "3. Atur jarak berdiri dan radius mob kalau posisi teleport terasa aneh.\n"
         .. "4. Buka tab Terbang, nyalakan Fly. Atur ketinggian hover sesuai kebutuhan.\n"
         .. "5. RightShift menyembunyikan window. Tombol jeda memakai keybind sendiri (default F2).\n"
-        .. "6. Buka tab Run untuk memilih Rerun atau Ke Hub, baik lewat tombol maupun otomatis saat run selesai.",
+        .. "6. Buka tab Run untuk memilih Rerun atau Ke Hub, baik lewat tombol maupun otomatis saat run selesai.\n"
+        .. "7. Di tab Run, bagian Auto Leave Kedalaman bisa mengakhiri run begitu meter DEPTH mencapai target.",
 })
 
 HelpSection:AddParagraph({
@@ -4126,7 +4345,9 @@ HelpSection:AddParagraph({
         .. "StartSession(worldId) supaya run baru benar-benar dimulai. Kalau "
         .. "StartSession ditolak karena sesi lama belum selesai, hub mencoba lagi "
         .. "selama beberapa detik. Toggle otomatis bekerja saat layar hasil (RunEnd) "
-        .. "terbuka. Ke Hub selalu mematikan Auto Farm lebih dulu; Rerun membiarkan "
+        .. "terbuka. Auto leave kedalaman memakai angka DEPTH yang sama dengan HUD "
+        .. "dan mengirim LeaveRun di tengah run begitu target meter tercapai. "
+        .. "Ke Hub selalu mematikan Auto Farm lebih dulu; Rerun membiarkan "
         .. "Auto Farm jalan dan memindai plate baru setelah karakter berpindah.",
 })
 
@@ -4202,6 +4423,52 @@ S.leaveThread = task.spawn(function()
     end
 end)
 
+-- Auto leave kedalaman. Dipicu sekali per run: setelah target tercapai,
+-- LeaveRun dikirim; flag baru dilepas lagi ketika karakter keluar dari run,
+-- jadi rerun berikutnya bisa memicu lagi dari awal.
+S.depthThread = task.spawn(function()
+    while S.alive do
+        if CFG.depthLeave then
+            local depth = liveDepthMetres()
+            S.depthNow = depth
+            if depth and not S.depthLeaveArmed and depth >= CFG.depthLeaveAt then
+                S.depthLeaveArmed = true
+                local mode = CFG.leaveMode
+                BPUI:Notify({
+                    Title = "Run",
+                    Content = string.format(
+                        "Kedalaman %d m tercapai. %s...",
+                        depth,
+                        mode == "rerun" and "Rerun" or "Kembali ke hub"
+                    ),
+                    Type = "Info",
+                    Duration = 4,
+                })
+                task.delay(CFG.depthLeaveDelay, function()
+                    if not S.alive or not CFG.depthLeave then
+                        S.depthLeaveArmed = false
+                        return
+                    end
+                    local nowDepth = liveDepthMetres()
+                    if not nowDepth or nowDepth < CFG.depthLeaveAt then
+                        S.depthLeaveArmed = false
+                        return
+                    end
+                    if not api.LeaveRun(mode) then
+                        S.depthLeaveArmed = false
+                    end
+                end)
+            elseif not depth then
+                S.depthLeaveArmed = false
+            end
+        else
+            S.depthNow = nil
+            S.depthLeaveArmed = false
+        end
+        task.wait(0.25)
+    end
+end)
+
 -- Equipment set tetap jalan walau Auto Farm mati, supaya ikut pedang/pickaxe manual.
 S.loadoutThread = task.spawn(function()
     while S.alive do
@@ -4240,6 +4507,11 @@ task.spawn(function()
         pcall(function()
             if S.runCard then
                 S.runCard:SetContent(runStatusText())
+            end
+        end)
+        pcall(function()
+            if S.depthCard then
+                S.depthCard:SetContent(depthStatusText())
             end
         end)
         task.wait(0.5)
