@@ -51,6 +51,11 @@
     14. Anti AFK: merespons sinyal Idled Roblox dengan satu klik virtual supaya
         sesi tidak ditendang setelah 20 menit tanpa input. Tidak ada klik
         berkala; toggle-nya ada di tab Farm > Anti AFK.
+    15. Mode tengah (Delve): karakter berdiri di lane tengah shaft, bukan di
+        sel batu, lalu Aim diarahkan ke batu paling dekat titik tengah baris.
+        Batu di kiri-kanan ikut kena radius pickaxe, jadi tidak perlu teleport
+        ke tiap sel. Cocok kalau Mining Range (Radius) pickaxe sudah lebar.
+        Toggle-nya ada di tab Farm > Auto Farm.
 
   Catatan protokol (dibaca dari StrataClient.Controllers):
     - MiningInput mengirim StrataNet.Aim:FireServer(x, z, true) lalu Aim(0, 0, false) saat lepas.
@@ -95,6 +100,7 @@
     getgenv().DelveFarm.SetDepthTarget(500)
     getgenv().DelveFarm.SetFocusMining(true/false)
     getgenv().DelveFarm.SetBehindFirst(true/false)
+    getgenv().DelveFarm.SetCenterMine(true/false)
     getgenv().DelveFarm.SetAntiAfk(true/false)
     getgenv().DelveFarm.AntiAfkPulse()
 
@@ -151,6 +157,7 @@ local CFG = {
     rockBlacklist = 20,        -- lama rock di-blacklist
     rockScanInterval = 0.5,
     behindFirst = true,        -- Delve: batu di sel kedalaman belakang ditambang dulu
+    centerMine = true,         -- Delve: berdiri di lane tengah, aim ke tengah baris
 
     -- combat
     mobScanInterval = 0.25,
@@ -645,6 +652,18 @@ local function combatWanted(session)
     return delveNeedsCombat(session)
 end
 
+-- Mode tengah hanya berlaku di Delve, sama seperti Prioritas Batu Belakang.
+local function centerMineActive()
+    if not CFG.centerMine then
+        return false
+    end
+    local session = delveSession()
+    if session and type(session.worldId) == "string" and session.worldId ~= "" then
+        return session.worldId == "delve"
+    end
+    return currentWorldId() == "delve"
+end
+
 -- ============================================================
 -- State
 -- ============================================================
@@ -659,6 +678,8 @@ local S = {
     focusCombat = false, -- hasil terakhir combatWanted()
     focusToggle = nil,
     behindToggle = nil,
+    centerToggle = nil,
+    centerRow = nil,     -- baris kedalaman yang sedang ditambang mode tengah
     want = nil,          -- "pickaxe" atau "weapon"
     wantAt = 0,
     aimX = 0,
@@ -1025,6 +1046,7 @@ local function chestAbort(keepPosition)
         S.stand = nil
         S.rockPos = nil
         S.snappedRock = nil
+        S.centerRow = nil
     end
     S.chestBusy = false
     S.chestTarget = nil
@@ -2372,12 +2394,17 @@ local function hoverTargetFor(hrp)
         if not rock or not rock.Parent then
             return nil
         end
-        local base = CFG.hoverRock and S.rockPos or S.stand
+        -- Mode tengah: hover di atas lane tengah, bukan di atas batu, supaya
+        -- badan tidak bergeser setiap kali target aim berganti ke batu lain.
+        local centered = centerMineActive() and S.stand ~= nil
+        local base = centered and S.stand or (CFG.hoverRock and S.rockPos or S.stand)
         if not base then
             return nil
         end
         local top = base.Y
-        if CFG.hoverRock then
+        if centered then
+            top = S.stand.Y - 3.2
+        elseif CFG.hoverRock then
             local ok, cf, size = pcall(function()
                 local c, s = rock:GetBoundingBox()
                 return c, s
@@ -2551,11 +2578,177 @@ local function behindFirstActive()
     return currentWorldId() == "delve"
 end
 
+-- Lebar lane shaft untuk satu baris kedalaman. Delve.spanAt dipakai game
+-- sendiri saat menggambar lantai (PlateRenderer), jadi lane tengah di sini
+-- sama dengan tengah shaft yang sedang aktif.
+local function centerLaneFor(row)
+    local app = getApp()
+    local plate = app and app.State and (app.State.plate or app.State.area)
+    if DelveShared and type(DelveShared.spanAt) == "function" then
+        local extra = 0
+        if type(plate) == "table" and type(DelveShared.extraOf) == "function" then
+            local ok, value = pcall(DelveShared.extraOf, plate)
+            if ok and type(value) == "number" then
+                extra = value
+            end
+        end
+        local ok, lo, hi = pcall(DelveShared.spanAt, row, extra)
+        if ok and type(lo) == "number" and type(hi) == "number" then
+            return (lo + hi) * 0.5
+        end
+    end
+    return 4.5
+end
+
+local CELL_SIZE = 8
+pcall(function()
+    local strata = ReplicatedStorage:FindFirstChild("Strata")
+    local config = strata and require(strata.Config)
+    local size = config and config.Grid and config.Grid.CellSize
+    if type(size) == "number" and size > 0 then
+        CELL_SIZE = size
+    end
+end)
+
+-- Titik dunia satu sel grid. Grid.toWorld butuh plate; kalau app tidak
+-- terbaca (executor mobile), posisi batu di baris yang sama digeser sepanjang
+-- sumbu lane (world X), karena shaft Delve memakai X untuk lane.
+local function cellWorld(row, lane, refPivot, refZ)
+    local app = getApp()
+    local plate = app and app.State and (app.State.plate or app.State.area)
+    if type(GridShared) == "table" and type(GridShared.toWorld) == "function" and type(plate) == "table" then
+        local ok, pos = pcall(GridShared.toWorld, plate, row, lane)
+        if ok and typeof(pos) == "Vector3" then
+            return pos
+        end
+    end
+    if refPivot and type(refZ) == "number" then
+        return Vector3.new(refPivot.X + (lane - refZ) * CELL_SIZE, refPivot.Y, refPivot.Z)
+    end
+    return nil
+end
+
+-- Jarak aim yang diizinkan server, dalam sel. Sama dengan MiningInput:_reach().
+local function mineReach()
+    local session = delveSession()
+    local reach = session and session.stats and tonumber(session.stats.Reach)
+    if reach and reach > 0.2 then
+        return reach
+    end
+    return 1.1
+end
+
+-- Mode tengah: pilih satu baris kedalaman, berdiri di lane tengah baris itu,
+-- lalu aim ke batu yang paling dekat dengan titik tengah baris. Batu kiri dan
+-- kanan tetap kena karena radius pickaxe dihitung dari sel aim.
+local function pickRockCenter(hrp, now)
+    local useBehind = behindFirstActive()
+    local playerX = useBehind and playerCellX(hrp) or nil
+    local rows = {}
+    for _, r in ipairs(S.rocks) do
+        if r.model.Parent then
+            local until_ = S.blacklist[r.model]
+            if not until_ or until_ <= now then
+                local ok, pivot = pcall(function()
+                    return r.model:GetPivot().Position
+                end)
+                if ok and pivot then
+                    local d = (Vector3.new(pivot.X - hrp.Position.X, 0, pivot.Z - hrp.Position.Z)).Magnitude
+                    local row = rows[r.x]
+                    if not row then
+                        row = {
+                            x = r.x,
+                            minD = d,
+                            behind = playerX ~= nil and r.x < playerX,
+                            rocks = {},
+                        }
+                        rows[r.x] = row
+                    end
+                    if d < row.minD then
+                        row.minD = d
+                    end
+                    row.rocks[#row.rocks + 1] = { rock = r, pivot = pivot, d = d }
+                end
+            end
+        end
+    end
+
+    -- Baris yang sedang berjalan dipertahankan selama masih ada batunya supaya
+    -- karakter tidak bolak-balik antar baris hanya karena satu batu habis.
+    local row = S.centerRow and rows[S.centerRow] or nil
+    if not row then
+        local bestScore
+        for _, candidate in pairs(rows) do
+            -- Baris belakang tetap menang kalau Prioritas Batu Belakang aktif.
+            local score = candidate.minD + (candidate.behind and 0 or 100000)
+            if not bestScore or score < bestScore then
+                row, bestScore = candidate, score
+            end
+        end
+    end
+    if not row then
+        S.centerRow = nil
+        return false
+    end
+
+    local lane = centerLaneFor(row.x)
+    local aim
+    for _, entry in ipairs(row.rocks) do
+        if not aim or math.abs(entry.rock.z - lane) < math.abs(aim.rock.z - lane) then
+            aim = entry
+        end
+    end
+    if not aim then
+        return false
+    end
+
+    -- Kalau Reach masih kecil, jangan paksa aim dari tengah: bergeser sedikit
+    -- ke arah batu supaya sel aim tetap masuk jangkauan server.
+    local reach = mineReach()
+    local maxOff = math.max(reach - 0.35, 0.6)
+    local standLane = lane
+    local diff = lane - aim.rock.z
+    if math.abs(diff) > maxOff then
+        standLane = aim.rock.z + sign(diff) * maxOff
+    end
+
+    local world = cellWorld(row.x, standLane, aim.pivot, aim.rock.z)
+    local stand, rockPos
+    if world then
+        local floor = floorAt(world.X, world.Z, aim.pivot.Y)
+        if floor then
+            stand = Vector3.new(world.X, floor.Y + 3.2, world.Z)
+            rockPos = aim.pivot
+        end
+    end
+    if not stand then
+        -- Lane tengah tidak ada lantainya: kembali ke cara lama (sel batu).
+        stand, rockPos = standFor(aim.rock.model, hrp.Position)
+    end
+    if not stand then
+        S.blacklist[aim.rock.model] = now + 5
+        return false
+    end
+
+    S.rock = aim.rock.model
+    S.rockX = aim.rock.x
+    S.rockZ = aim.rock.z
+    S.rockSince = now
+    S.stand = stand
+    S.rockPos = rockPos
+    S.snappedRock = nil
+    S.centerRow = row.x
+    return true
+end
+
 local function pickRock(hrp, nearestOnly)
     local now = os.clock()
     if now - S.rocksAt > CFG.rockScanInterval then
         S.rocks = scanRocks()
         S.rocksAt = now
+    end
+    if not nearestOnly and centerMineActive() and pickRockCenter(hrp, now) then
+        return true
     end
     local useBehind = not nearestOnly and behindFirstActive()
     local playerX = useBehind and playerCellX(hrp) or nil
@@ -2972,6 +3165,7 @@ function api.Start()
     S.rock = nil
     S.stand = nil
     S.rockPos = nil
+    S.centerRow = nil
     S.lastAimSent = 0
     S.warned = false
     S.pendingSwing = nil
@@ -3009,6 +3203,7 @@ function api.Stop()
     S.rock = nil
     S.stand = nil
     S.rockPos = nil
+    S.centerRow = nil
     S.pendingSwing = nil
     releaseAim()
     chestAbort()
@@ -3073,6 +3268,19 @@ function api.SetBehindFirst(on)
         end)
     end
     return CFG.behindFirst
+end
+
+function api.SetCenterMine(on)
+    CFG.centerMine = on and true or false
+    if not CFG.centerMine then
+        S.centerRow = nil
+    end
+    if S.centerToggle then
+        pcall(function()
+            S.centerToggle:Set(CFG.centerMine, true)
+        end)
+    end
+    return CFG.centerMine
 end
 
 function api.SetLoadoutAuto(on)
@@ -3354,6 +3562,7 @@ function api.LeaveRun(mode)
     S.rockZ = 0
     S.rockPos = nil
     S.stand = nil
+    S.centerRow = nil
     S.rocks = {}
     S.rocksAt = 0
     S.teleportedAt = 0
@@ -3611,6 +3820,7 @@ getgenv().DelveFarm = api
 S.connChar = plr.CharacterAdded:Connect(function(char)
     S.rock = nil
     S.stand = nil
+    S.centerRow = nil
     S.mode = nil
     S.teleportedAt = 0
     S.mobsAt = 0
@@ -3676,6 +3886,11 @@ local function statusText()
         end
     else
         lines[#lines + 1] = "Fokus mining: nonaktif"
+    end
+
+    if centerMineActive() then
+        lines[#lines + 1] = "Mode tengah: baris "
+            .. (S.centerRow and tostring(S.centerRow) or "-")
     end
 
     if S.rock and S.rock.Parent then
@@ -3891,6 +4106,16 @@ S.behindToggle = MainSection:AddToggle({
     Default = CFG.behindFirst,
     Callback = function(on)
         api.SetBehindFirst(on)
+    end,
+})
+
+S.centerToggle = MainSection:AddToggle({
+    Name = "Center Mining (Delve)",
+    Description = "In Delve, stands in the middle lane of the shaft and aims at the middle of the row. Rocks on both sides are covered by the pickaxe Mining Range, so there is no teleport to every cell. Use when Mining Range is already wide.",
+    Flag = "DelveCenterMine",
+    Default = CFG.centerMine,
+    Callback = function(on)
+        api.SetCenterMine(on)
     end,
 })
 
