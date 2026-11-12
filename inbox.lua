@@ -77,12 +77,12 @@
         Portal ReturnGate milik Vesper Sanctum di hub selalu diabaikan.
         Toggle ada di tab Run > Auto Prestige.
     18. Auto time save (Delve): clock collapse adalah ETA server terhadap
-        dinding collapse. Saat clock di bawah batas (bawaan 12 detik), hub
-        memindahkan karakter satu baris melewati batas chamber. Transisi
-        chamber me-reset clock ke budget chamber baru (biasanya 50+ detik),
-        jadi run dapat waktu darurat. Ini darurat: batu yang tersisa di
-        chamber lama dilewati dan kedalaman ikut maju. Toggle ada di tab
-        Run > Collapse Time Save.
+        dinding collapse, bukan countdown tetap. Saat chamber SUDAH BERSIH
+        (0 batu tersisa) dan clock di bawah batas, hub memindahkan karakter
+        satu baris melewati batas chamber untuk menyelesaikan crossing darurat.
+        Ini tidak menambah waktu gratis: lompat dengan batu tersisa hanya
+        membuang loot dan tidak me-refresh clock. Toggle ada di tab Run >
+        Collapse Time Save (bawaan mati).
 
   Catatan protokol (dibaca dari StrataClient.Controllers):
     - MiningInput mengirim StrataNet.Aim:FireServer(x, z, true) lalu Aim(0, 0, false) saat lepas.
@@ -4052,11 +4052,10 @@ function Prestige.step(hrp)
 end
 
 -- Auto time save: clock collapse Delve adalah ETA server terhadap dinding
--- collapse. Begitu karakter masuk chamber berikutnya, clock di-reset ke budget
--- chamber baru (lebih besar kalau clock sekarang sudah rendah). Jadi saat
--- clock hampir habis, teleport satu baris melewati batas chamber untuk
--- menyegarkan clock. Ini darurat saja: batu yang tersisa di chamber lama
--- dilewati.
+-- collapse, bukan countdown tetap. Saat chamber sudah bersih dan clock hampir
+-- habis, teleport satu baris melewati batas chamber untuk menyelesaikan
+-- crossing darurat. TIDAK ada free refill: lompat dengan batu tersisa hanya
+-- membuang loot dan clock tetap rendah (sudah terbukti di depth 85+).
 local function timeSaveStep(hrp, session, force)
     if not force and (not CFG.timeSave or not S.running or S.paused) then
         return false
@@ -4077,6 +4076,13 @@ local function timeSaveStep(hrp, session, force)
     local chamber = tonumber(session.chamber)
     local ends = tonumber(session.chamberEnds)
     if not chamber or not ends then
+        return false
+    end
+    -- Hanya lompat kalau chamber sudah bersih. Lompat dengan batu tersisa
+    -- tidak me-refresh clock (ETA collapse dihitung dari posisi dinding), jadi
+    -- hanya membuang loot. Gate ini juga berlaku untuk manual.
+    local rocksLeft = tonumber(session.rocksLeft)
+    if rocksLeft == nil or rocksLeft > 0 then
         return false
     end
     local now = os.clock()
@@ -5734,9 +5740,10 @@ local TimeSaveSection = RunTab:CreateSection("Collapse Time Save")
 
 S.timeSaveToggle = TimeSaveSection:AddToggle({
     Name = "Auto Time Save (Chamber Skip)",
-    Description = "Requires Auto Farm running. When the delve clock falls below the threshold, the character is teleported "
-        .. "just past the chamber boundary. Crossing into the next chamber resets the collapse clock, so the run gets a "
-        .. "fresh timer. Emergency only: rocks left in the current chamber are skipped.",
+    Description = "Requires Auto Farm running. Emergency crossing only: when the chamber is already cleared (0 rocks left) "
+        .. "and the delve clock falls below the threshold, the character is teleported just past the chamber boundary. "
+        .. "It never skips un-mined rocks. Note: the clock is a server ETA, so this does not create free time; it only "
+        .. "finishes a crossing you already earned.",
     Default = CFG.timeSave,
     Flag = "DelveTimeSave",
     Callback = function(on)
@@ -5746,7 +5753,7 @@ S.timeSaveToggle = TimeSaveSection:AddToggle({
 
 S.timeSaveInput = TimeSaveSection:AddInput({
     Name = "Save Below (seconds)",
-    Description = "Type a number of seconds and press Enter. 12 is a good default; a new chamber usually resets the clock to 50+ seconds.",
+    Description = "Type a number of seconds and press Enter. Only used when the current chamber is fully cleared.",
     Default = tostring(CFG.timeSaveBelow),
     Placeholder = "e.g. 12",
     Numeric = true,
@@ -5759,7 +5766,7 @@ S.timeSaveInput = TimeSaveSection:AddInput({
 
 TimeSaveSection:AddButton({
     Name = "Save Time Now",
-    Description = "Manual test. Teleports past the current chamber boundary once, even if the clock is still high.",
+    Description = "Manual crossing test. Only works when the current chamber is fully cleared (0 rocks left).",
     Callback = function()
         api.TimeSaveNow()
     end,
