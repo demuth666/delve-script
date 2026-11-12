@@ -18,11 +18,15 @@
        wave di sekitar chest diserang dulu sampai chest jadi unlocked, lalu
        chest disentuh supaya terbuka dan hadiahnya diambil. Begitu hadiah
        tercatat, karakter langsung lanjut mining tanpa menunggu chest hilang.
-    8. Auto pilih relic: relic yang dipilih di tab Relic diutamakan. Kalau
-       tidak ada di draft, fallback ke rarity tertinggi. Pilihan dikirim
-       lewat StrataNet.PickRelic setelah draft muncul. Draft berbentuk kartu
-       (shrine relic/blessing) ikut dipilih. Pilihan path dan pembelian
-       trader diatur di bagian "Path & Trader" (default manual).
+    8. Auto pilih relic: relic yang dipilih di tab Relic diutamakan. Selain
+       itu ada pilihan set relic (Assassin, Frost, dan set lain dari
+       Strata.Defs.Relics.Archetypes); relic dari set target dipilih lebih
+       dulu, dan bagian set yang belum dimiliki didahulukan supaya bonus set
+       cepat lengkap. Kalau tidak ada yang cocok, fallback ke rarity
+       tertinggi. Pilihan dikirim lewat StrataNet.PickRelic setelah draft
+       muncul. Draft berbentuk kartu (shrine relic/blessing) ikut dipilih.
+       Pilihan path dan pembelian trader diatur di bagian "Path & Trader"
+       (default manual).
     9. Auto ganti equipment set (loadout): pilih set pedang, set mining, dan
        set diam lewat dropdown di tab Farm > Equipment Set. Saat pedang
        terhunus karakter pindah ke set pedang, saat pickaxe keluar pindah ke
@@ -56,6 +60,14 @@
         Batu di kiri-kanan ikut kena radius pickaxe, jadi tidak perlu teleport
         ke tiap sel. Cocok kalau Mining Range (Radius) pickaxe sudah lebar.
         Toggle-nya ada di tab Farm > Auto Farm.
+   16. Mekanik boss (Delve): HeartPylon menembakkan HeartLink ke Worldheart
+        dan menyembuhkannya; MarbleSentry, Fragment of Light, dan Blackheart
+        Vein juga helper. Hub mendahulukan helper ini sebelum boss. Toggle
+        Focus Real Boss membuat hub melewati decoy/add dan fokus ke model
+        dengan atribut Boss supaya fase summon/frenzy cepat keluar. Auto
+        Trigger Prompt menembak ProximityPrompt / ClickDetector di dekat
+        karakter untuk trigger gate/spawn. Semua ada di tab Farm > Boss
+        Mechanics.
 
   Catatan protokol (dibaca dari StrataClient.Controllers):
     - MiningInput mengirim StrataNet.Aim:FireServer(x, z, true) lalu Aim(0, 0, false) saat lepas.
@@ -87,6 +99,7 @@
     getgenv().DelveFarm.Start() / .Pause() / .Resume() / .Stop() / .Destroy()
     getgenv().DelveFarm.SetFly(true/false) / .ToggleFly()
     getgenv().DelveFarm.SetRelicPriority({ "blast", "echo" })
+    getgenv().DelveFarm.SetRelicSets({ "assassin", "frost" })
     getgenv().DelveFarm.SetAutoAscend(true/false)
     getgenv().DelveFarm.SetAscendTo("hollow" / "farside")
     getgenv().DelveFarm.SetPathPick("safe" / "cursed" / "manual")
@@ -101,6 +114,9 @@
     getgenv().DelveFarm.SetFocusMining(true/false)
     getgenv().DelveFarm.SetBehindFirst(true/false)
     getgenv().DelveFarm.SetCenterMine(true/false)
+    getgenv().DelveFarm.SetBossHelpers(true/false)
+    getgenv().DelveFarm.SetBossFocus(true/false)
+    getgenv().DelveFarm.SetBossTrigger(true/false)
     getgenv().DelveFarm.SetAntiAfk(true/false)
     getgenv().DelveFarm.AntiAfkPulse()
 
@@ -165,6 +181,14 @@ local CFG = {
     mobRelease = 42,           -- baru balik ke pickaxe kalau mob sudah lebih jauh
     chaseStop = 7,
     equipRetry = 0.35,         -- jeda minimum antar PickaxeOut / WeaponDrawn
+
+    -- boss mechanics (Delve)
+    bossHelpers = true,        -- dahulukan pylon/sentry/healer sebelum boss
+    bossFocus = true,          -- fokus boss asli, lewati decoy/add supaya fase cepat keluar
+    bossTrigger = false,       -- tembak ProximityPrompt / ClickDetector di dekat karakter
+    bossRadius = 240,          -- radius cari helper/boss, stud
+    bossTriggerInterval = 0.8, -- jeda antar scan trigger, detik
+    bossTriggerCooldown = 2,   -- jeda per trigger supaya tidak spam, detik
 
     -- equipment set (loadout 1..3), nilai awal; bisa diubah dari dropdown UI
     loadoutAuto = true,        -- ganti equipment set otomatis
@@ -700,6 +724,18 @@ local S = {
     rocksAt = 0,
     mobs = {},
     mobsAt = 0,
+    boss = nil,               -- model boss asli (punya atribut Boss)
+    bossHelpersList = {},     -- pylon/sentry/healer yang sedang hidup
+    bossAt = 0,
+    bossHelpersToggle = nil,
+    bossFocusToggle = nil,
+    bossTriggerToggle = nil,
+    bossCard = nil,
+    triggerables = {},        -- cache ProximityPrompt / ClickDetector
+    triggerAt = 0,
+    triggerFiredAt = {},
+    connTriggerAdded = nil,
+    connTriggerRemoved = nil,
     blacklist = {},
     warned = false,
     chaseAt = 0,
@@ -769,6 +805,8 @@ local S = {
     -- relic
     relicPriority = {},    -- set id -> true
     relicOrder = {},       -- id urut sesuai pilihan pemain
+    relicSetWanted = {},   -- set/archetype id -> true
+    relicSetOrder = {},    -- archetype urut sesuai pilihan pemain
     relicStatus = "Belum ada draft relic.",
     relicSeq = 0,
     relicLast = nil,
@@ -776,6 +814,8 @@ local S = {
     connRelic = nil,
     relicDropdown = nil,
     relicCard = nil,
+    relicSetDropdown = nil,
+    relicSetCard = nil,
 
     -- auto ascend
     ascendPicks = 0,
@@ -848,10 +888,11 @@ local function scanMobs()
     local list = {}
     local myRun = plr:GetAttribute("RunId")
     for _, m in ipairs(workspace:GetChildren()) do
-        if m:IsA("Model") and m:GetAttribute("MobId") ~= nil and m.PrimaryPart then
+        if m:IsA("Model") and m:GetAttribute("MobId") ~= nil then
             if m:GetAttribute("Dead") ~= true then
                 local hum = m:FindFirstChildOfClass("Humanoid")
-                if not hum or hum.Health > 0 then
+                local part = m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart")
+                if part and (not hum or hum.Health > 0) then
                     local mobRun = m:GetAttribute("RunId")
                     if myRun == nil or mobRun == nil or mobRun == myRun then
                         table.insert(list, m)
@@ -863,28 +904,218 @@ local function scanMobs()
     return list
 end
 
+-- Helper boss: pylon/sentry/healer yang membuat boss kebal atau sembuh.
+-- HeartPylon punya anak HeartLink (Beam) ke Worldheart; MarbleSentry punya
+-- ShieldBoss; StarFragmentMend dan BlackheartVein juga masuk daftar ini.
+local BOSS_HELPER_KINDS = {
+    heart_pylon = true,
+    marble_sentry = true,
+    star_fragment_mend = true,
+    blackheart_vein = true,
+}
+local BOSS_HELPER_NAMES = {
+    HeartPylon = true,
+    MarbleSentry = true,
+    StarFragmentMend = true,
+    BlackheartVein = true,
+}
+
+local function mobDistance(pos, m)
+    local pp = m and (m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart"))
+    if not pp or not m.Parent then
+        return nil
+    end
+    local p = pp.Position
+    return (Vector3.new(p.X - pos.X, 0, p.Z - pos.Z)).Magnitude
+end
+
+local function mobIsRealBoss(m)
+    return m.Parent ~= nil
+        and m:GetAttribute("Dead") ~= true
+        and m:GetAttribute("Boss") ~= nil
+end
+
+local function mobIsBossHelper(m)
+    if m.Parent == nil or m:GetAttribute("Dead") == true then
+        return false
+    end
+    local kind = m:GetAttribute("MobKind")
+    if type(kind) == "string" and BOSS_HELPER_KINDS[kind] then
+        return true
+    end
+    return BOSS_HELPER_NAMES[m.Name] == true
+end
+
+local function nearestFromList(list, pos, radius)
+    local best, bestD
+    for _, m in ipairs(list) do
+        local d = mobDistance(pos, m)
+        if d and d <= radius and (not bestD or d < bestD) then
+            best, bestD = m, d
+        end
+    end
+    return best, bestD
+end
+
+local function refreshBossTargets()
+    local boss, helpers = nil, {}
+    for _, m in ipairs(S.mobs) do
+        if mobIsRealBoss(m) then
+            if not boss then
+                boss = m
+            end
+        end
+        if mobIsBossHelper(m) then
+            helpers[#helpers + 1] = m
+        end
+    end
+    S.boss = boss
+    S.bossHelpersList = helpers
+end
+
 local function nearestMob(pos)
     local now = os.clock()
     if now - S.mobsAt > CFG.mobScanInterval then
         S.mobs = scanMobs()
         S.mobsAt = now
+        refreshBossTargets()
+        S.bossAt = now
+    elseif now - S.bossAt > 0.1 then
+        -- Atribut boss bisa berubah (mati, airborne, fase) tanpa scan ulang.
+        refreshBossTargets()
+        S.bossAt = now
     end
+
+    -- 1) Pylon/sentry/healer dulu. Selama HeartLink hidup, Worldheart
+    --    disembuhkan/disembunyikan; boss tidak akan turun HP dengan benar.
+    if CFG.bossHelpers and S.boss then
+        local helper, helperD = nearestFromList(S.bossHelpersList, pos, CFG.bossRadius)
+        if helper then
+            return helper, helperD
+        end
+    end
+
+    -- 2) Fokus boss asli supaya HP-nya cepat melewati fase summon/frenzy.
+    --    Decoy Unmaker dan add lain tidak punya atribut Boss, jadi dilewati.
+    if CFG.bossFocus and S.boss then
+        local airborne = S.boss:GetAttribute("Airborne") == true
+            or S.boss:GetAttribute("aloft") == true
+        local bossD = mobDistance(pos, S.boss)
+        if not airborne and bossD and bossD <= CFG.bossRadius then
+            return S.boss, bossD
+        end
+    end
+
     local radius = CFG.mobDetect
     if S.mode == "fight" then
         radius = CFG.mobRelease
     end
-    local best, bestD
-    for _, m in ipairs(S.mobs) do
-        local pp = m.PrimaryPart
-        if pp and m.Parent then
-            local p = pp.Position
-            local d = (Vector3.new(p.X - pos.X, 0, p.Z - pos.Z)).Magnitude
-            if d <= radius and (not bestD or d < bestD) then
-                best, bestD = m, d
+    return nearestFromList(S.mobs, pos, radius)
+end
+
+-- Cache ProximityPrompt / ClickDetector supaya trigger spawn/gate bisa
+-- ditembak tanpa scan seluruh workspace setiap tick.
+local function addTriggerable(inst)
+    if inst:IsA("ProximityPrompt") or inst:IsA("ClickDetector") then
+        S.triggerables[inst] = true
+    end
+end
+
+local function removeTriggerable(inst)
+    S.triggerables[inst] = nil
+end
+
+local function startTriggerWatch()
+    if S.connTriggerAdded then
+        return
+    end
+    S.connTriggerAdded = workspace.DescendantAdded:Connect(addTriggerable)
+    S.connTriggerRemoved = workspace.DescendantRemoving:Connect(removeTriggerable)
+    task.defer(function()
+        if not S.alive then
+            return
+        end
+        for _, inst in ipairs(workspace:GetDescendants()) do
+            addTriggerable(inst)
+        end
+    end)
+end
+
+local function stopTriggerWatch()
+    if S.connTriggerAdded then
+        pcall(function()
+            S.connTriggerAdded:Disconnect()
+        end)
+        S.connTriggerAdded = nil
+    end
+    if S.connTriggerRemoved then
+        pcall(function()
+            S.connTriggerRemoved:Disconnect()
+        end)
+        S.connTriggerRemoved = nil
+    end
+    S.triggerables = {}
+    S.triggerFiredAt = {}
+end
+
+local function promptPart(inst)
+    local parent = inst.Parent
+    if not parent then
+        return nil
+    end
+    if parent:IsA("BasePart") then
+        return parent
+    end
+    return parent:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function triggerStep(hrp)
+    if not CFG.bossTrigger or not hrp then
+        return false
+    end
+    local now = os.clock()
+    if now - S.triggerAt < CFG.bossTriggerInterval then
+        return false
+    end
+    S.triggerAt = now
+
+    local session = delveSession()
+    if not session or session.worldId ~= "delve" then
+        return false
+    end
+
+    for inst in pairs(S.triggerables) do
+        if inst.Parent then
+            local last = S.triggerFiredAt[inst] or 0
+            if now - last >= CFG.bossTriggerCooldown then
+                local part = promptPart(inst)
+                if part then
+                    local maxDist = tonumber(inst:IsA("ProximityPrompt") and inst.MaxActivationDistance
+                        or inst.MaxActivationDistance) or 10
+                    local dist = (part.Position - hrp.Position).Magnitude
+                    if dist <= math.min(maxDist, 24) then
+                        local ok
+                        if inst:IsA("ProximityPrompt") then
+                            if inst.Enabled == false then
+                                ok = false
+                            else
+                                ok = pcall(fireproximityprompt, inst)
+                            end
+                        else
+                            ok = pcall(fireclickdetector, inst)
+                        end
+                        if ok then
+                            S.triggerFiredAt[inst] = now
+                            return true
+                        end
+                    end
+                end
             end
+        else
+            S.triggerables[inst] = nil
         end
     end
-    return best, bestD
+    return false
 end
 
 local function weaponStats()
@@ -1263,6 +1494,16 @@ local relicIdToLabel = {}
 local relicNameToId = {}
 local relicOptions = {}
 
+-- Set relic = archetype di Strata.Defs.Relics (ASSASSIN, FROST, dst).
+-- Bonus set aktif setelah 5 relic berbeda dari archetype yang sama dimiliki.
+local relicSetLabelToId = {}
+local relicSetIdToLabel = {}
+local relicSetNameToId = {}
+local relicSetOptions = {}
+local relicSetDefs = {}
+
+local refreshRelicStatus
+
 local PATH_LABELS = { manual = "Manual", safe = "Safe Path", cursed = "Cursed Path" }
 local TRADER_LABELS = {
     manual = "Manual",
@@ -1307,11 +1548,82 @@ local function relicName(id)
     return string.format("%s [%s]", def.name, tostring(def.rarity))
 end
 
+local function makeRelicCandidate(index, id, def)
+    local counts = false
+    if def and Relics and type(Relics.counts) == "function" then
+        local ok, value = pcall(function()
+            return Relics:counts(def)
+        end)
+        counts = ok and value == true
+    end
+    return {
+        index = index,
+        id = id,
+        rank = relicRank(def),
+        archetype = def and def.archetype or nil,
+        counts = counts,
+    }
+end
+
+-- Archetype adalah set relic yang dipakai game (ASSASSIN, FROST, dst).
+-- Ukuran set dihitung dari relic berbeda yang tidak retired/keystone/fold,
+-- sama seperti Relics:archetypeSize, dan bonus aktif saat 5 sudah terkumpul.
+local function buildRelicSetOptions()
+    relicSetLabelToId = {}
+    relicSetIdToLabel = {}
+    relicSetNameToId = {}
+    relicSetOptions = {}
+    relicSetDefs = {}
+    if not Relics or type(Relics.Archetypes) ~= "table" then
+        return
+    end
+
+    local list = {}
+    local used = {}
+    for id, def in pairs(Relics.Archetypes) do
+        if type(id) == "string" and type(def) == "table" then
+            local name = tostring(def.name or string.upper(id))
+            local label = name
+            if used[label] then
+                label = label .. " (" .. id .. ")"
+            end
+            used[label] = true
+            local text = ""
+            if type(def.bonus) == "table" and type(def.bonus.text) == "string" then
+                text = def.bonus.text
+            end
+            list[#list + 1] = {
+                id = id,
+                label = label,
+                name = name,
+                order = tonumber(def.order) or 999,
+                text = text,
+            }
+        end
+    end
+
+    table.sort(list, function(a, b)
+        if a.order ~= b.order then
+            return a.order < b.order
+        end
+        return a.name < b.name
+    end)
+
+    for _, item in ipairs(list) do
+        relicSetOptions[#relicSetOptions + 1] = item.label
+        relicSetLabelToId[item.label] = item.id
+        relicSetIdToLabel[item.id] = item.label
+        relicSetNameToId[string.upper(item.name)] = item.id
+        relicSetDefs[item.id] = item
+    end
+end
+
 local function buildRelicOptions()
     relicLabelToId = {}
     relicIdToLabel = {}
     relicNameToId = {}
     relicOptions = {}
+    buildRelicSetOptions()
     if not Relics then
         return
     end
@@ -1377,6 +1689,131 @@ local function setRelicPriority(ids)
     S.relicPriority = set
 end
 
+local function resolveRelicSetId(value)
+    if type(value) ~= "string" or value == "" then
+        return nil
+    end
+    if relicSetIdToLabel[value] then
+        return value
+    end
+    local lower = string.lower(value)
+    if relicSetIdToLabel[lower] then
+        return lower
+    end
+    return relicSetLabelToId[value] or relicSetNameToId[string.upper(value)]
+end
+
+local function setRelicSets(ids)
+    if type(ids) == "string" then
+        ids = { ids }
+    end
+    if type(ids) ~= "table" then
+        ids = {}
+    end
+    local order = {}
+    local wanted = {}
+    for _, value in ipairs(ids) do
+        local id = resolveRelicSetId(value)
+        if id and not wanted[id] then
+            order[#order + 1] = id
+            wanted[id] = true
+        end
+    end
+    S.relicSetOrder = order
+    S.relicSetWanted = wanted
+end
+
+-- Relic yang sedang dipegang run ini. Dipakai untuk tahu bagian set mana yang
+-- belum dimiliki, supaya auto pick melengkapi set sebelum mengambil duplikat.
+local function ownedRelicMap()
+    local ok, relics = pcall(function()
+        local app = getApp()
+        local session = app and app.State and app.State.session
+        return session and session.relics or nil
+    end)
+    if ok and type(relics) == "table" then
+        return relics
+    end
+    return nil
+end
+
+local function relicSetSize(archetype)
+    if Relics and type(Relics.archetypeSize) == "function" then
+        local ok, size = pcall(function()
+            return Relics:archetypeSize(archetype)
+        end)
+        if ok and type(size) == "number" then
+            return size
+        end
+    end
+    return 5
+end
+
+local function relicSetHave(archetype, owned)
+    if not Relics or type(owned) ~= "table" then
+        return 0
+    end
+    local have = 0
+    for id, count in pairs(owned) do
+        if type(count) == "number" and count > 0 then
+            local ok, def = pcall(function()
+                return Relics:Find(id)
+            end)
+            if ok and def and def.archetype == archetype then
+                local counts = false
+                if type(Relics.counts) == "function" then
+                    local okCounts, value = pcall(function()
+                        return Relics:counts(def)
+                    end)
+                    counts = okCounts and value == true
+                end
+                if counts then
+                    have = have + 1
+                end
+            end
+        end
+    end
+    return have
+end
+
+local function relicSetInfoText()
+    if #S.relicSetOrder == 0 then
+        return "No target set. Auto pick only follows Priority Relics and the rarity fallback."
+    end
+
+    local inRun = isInRun()
+    local owned = nil
+    if inRun then
+        owned = ownedRelicMap()
+    end
+    local lines = {}
+    for _, id in ipairs(S.relicSetOrder) do
+        local info = relicSetDefs[id]
+        local name = info and info.name or string.upper(id)
+        local size = relicSetSize(id)
+        local line
+        if owned then
+            local have = math.min(relicSetHave(id, owned), size)
+            line = string.format("%s %d/%d", name, have, size)
+            local missing = size - have
+            if missing > 0 then
+                line = line .. string.format(" (need %d more)", missing)
+            else
+                line = line .. " (complete)"
+            end
+        elseif inRun then
+            line = string.format("%s ?/%d (progress unavailable)", name, size)
+        else
+            line = string.format("%s ?/%d (start a run to see progress)", name, size)
+        end
+        if info and info.text ~= "" then
+            line = line .. "\n" .. info.text
+        end
+        lines[#lines + 1] = line
+    end
+    return table.concat(lines, "\n\n")
+end
+
 local function saveRelicPrefs()
     pcall(function()
         local json = HttpService:JSONEncode({
@@ -1390,6 +1827,7 @@ local function saveRelicPrefs()
             ascendTo = CFG.ascendTo,
             ascendDelay = CFG.ascendDelay,
             ids = S.relicOrder,
+            sets = S.relicSetOrder,
         })
         writefile(RELIC_PREFS_FILE, json)
     end)
@@ -1443,6 +1881,18 @@ local function loadRelicPrefs()
         end
     end
     setRelicPriority(ids)
+
+    local sets = {}
+    if type(data.sets) == "string" then
+        sets[1] = data.sets
+    elseif type(data.sets) == "table" then
+        for _, id in ipairs(data.sets) do
+            if type(id) == "string" then
+                sets[#sets + 1] = id
+            end
+        end
+    end
+    setRelicSets(sets)
 end
 
 -- Kartu offer (trader, shrine, path) memakai judul, bukan id. Cocokkan dulu
@@ -1565,7 +2015,7 @@ local function chooseAscendIndex(cards)
     return hollowIndex, "ascend ke " .. ASCEND_LABELS.hollow
 end
 
--- candidates: { index = number, id = string?, rank = number }
+-- candidates: { index = number, id = string?, rank = number, archetype = string?, counts = boolean }
 local function chooseBest(candidates)
     local bestPriority, bestPriorityRank, bestPriorityOrder
     for _, c in ipairs(candidates) do
@@ -1583,6 +2033,48 @@ local function chooseBest(candidates)
     end
     if bestPriority then
         return bestPriority, "prioritas"
+    end
+
+    -- Set target: relic dari archetype yang dipilih menang atas rarity biasa.
+    -- Bagian set yang belum dimiliki didahulukan supaya bonus set cepat aktif;
+    -- duplikat tetap dipilih kalau tidak ada bagian baru di draft.
+    local bestSet, bestSetRank, bestSetOrder, bestSetArch, bestSetMissing
+    if #S.relicSetOrder > 0 then
+        local owned = ownedRelicMap()
+        for _, c in ipairs(candidates) do
+            if c.archetype and S.relicSetWanted[c.archetype] then
+                local order = table.find(S.relicSetOrder, c.archetype) or 999
+                local missing = false
+                if owned and c.id and c.counts then
+                    missing = (tonumber(owned[c.id]) or 0) <= 0
+                end
+                local better = false
+                if not bestSet then
+                    better = true
+                elseif missing ~= bestSetMissing then
+                    better = missing
+                elseif c.rank ~= bestSetRank then
+                    better = c.rank > bestSetRank
+                elseif order ~= bestSetOrder then
+                    better = order < bestSetOrder
+                end
+                if better then
+                    bestSet = c.index
+                    bestSetRank = c.rank
+                    bestSetOrder = order
+                    bestSetArch = c.archetype
+                    bestSetMissing = missing
+                end
+            end
+        end
+    end
+    if bestSet then
+        local info = relicSetDefs[bestSetArch]
+        local reason = "set " .. (info and info.name or string.upper(bestSetArch))
+        if bestSetMissing then
+            reason = reason .. " (lengkapi)"
+        end
+        return bestSet, reason
     end
 
     if CFG.relicFallback then
@@ -1610,7 +2102,7 @@ local function chooseRelicIndex(choices)
     for i, id in ipairs(choices) do
         local def = Relics:Find(id)
         if def then
-            candidates[#candidates + 1] = { index = i, id = id, rank = relicRank(def) }
+            candidates[#candidates + 1] = makeRelicCandidate(i, id, def)
         end
     end
     if #candidates == 0 then
@@ -1674,7 +2166,7 @@ local function chooseTraderIndex(cards)
 
     local maxPrice = tonumber(CFG.traderMaxPrice) or 0
 
-    local best, bestRank, bestPrice
+    local best, bestRank, bestPrice, bestReason
     for i, card in ipairs(cards) do
         if type(card) == "table" and card.afford ~= false then
             local price = cardPrice(card) or 0
@@ -1688,6 +2180,10 @@ local function chooseTraderIndex(cards)
                     rank = relicRank({ rarity = card.rarity })
                 end
                 local isRelic = rank > 0
+                local targetSet = def ~= nil
+                    and def.archetype ~= nil
+                    and S.relicSetWanted[def.archetype] == true
+                local explicitPriority = id ~= nil and S.relicPriority[id] == true
 
                 local wanted = false
                 if mode == "cheapest" then
@@ -1695,7 +2191,7 @@ local function chooseTraderIndex(cards)
                 elseif mode == "relic" then
                     wanted = isRelic
                 elseif mode == "priority" then
-                    wanted = id ~= nil and S.relicPriority[id] == true
+                    wanted = explicitPriority or targetSet
                 end
 
                 if wanted then
@@ -1704,12 +2200,15 @@ local function chooseTraderIndex(cards)
                             best = i
                             bestRank = rank
                             bestPrice = price
+                            bestReason = "trader termurah"
                         end
                     elseif not best or rank > bestRank or (rank == bestRank and price < bestPrice) then
                         -- Rarity tertinggi dulu, harga termurah sebagai penentu.
                         best = i
                         bestRank = rank
                         bestPrice = price
+                        bestReason = (targetSet and not explicitPriority) and "trader set"
+                            or "trader prioritas"
                     end
                 end
             end
@@ -1722,7 +2221,11 @@ local function chooseTraderIndex(cards)
             relic = "trader relic",
             cheapest = "trader termurah",
         }
-        return best, reasons[mode] or ("trader " .. tostring(mode))
+        local reason = reasons[mode] or ("trader " .. tostring(mode))
+        if mode == "priority" and bestReason then
+            reason = bestReason
+        end
+        return best, reason
     end
     return nil, "tidak ada item trader yang cocok"
 end
@@ -1760,7 +2263,7 @@ local function chooseCardIndex(cards, offer)
             local affordable = card.afford ~= false
             if def then
                 if affordable then
-                    candidates[#candidates + 1] = { index = i, id = id, rank = relicRank(def) }
+                    candidates[#candidates + 1] = makeRelicCandidate(i, id, def)
                 end
             elseif RELIC_TIERS[card.rarity] then
                 -- Nama kartu tidak cocok dengan def, tapi tier-nya relic. Tetap
@@ -1801,6 +2304,13 @@ local function cardName(card)
     return tostring(card.title or card.name or card.id or "?")
 end
 
+local function setRelicStatus(text)
+    S.relicStatus = text
+    if refreshRelicStatus then
+        refreshRelicStatus()
+    end
+end
+
 local function onRelicOffer(offer)
     if type(offer) ~= "table" then
         return
@@ -1808,7 +2318,7 @@ local function onRelicOffer(offer)
 
     if offer.closed then
         S.relicSeq = S.relicSeq + 1
-        S.relicStatus = "Draft relic ditutup."
+        setRelicStatus("Draft relic ditutup.")
         return
     end
 
@@ -1852,18 +2362,18 @@ local function onRelicOffer(offer)
     local seq = S.relicSeq
 
     if not CFG.autoRelic and not isAscend then
-        S.relicStatus = "Draft: " .. table.concat(names, " | ")
+        setRelicStatus("Draft: " .. table.concat(names, " | "))
         return
     end
 
     if not relicPickRemote then
-        S.relicStatus = "Fitur draft tidak tersedia."
+        setRelicStatus("Fitur draft tidak tersedia.")
         return
     end
 
     if not index then
         local prefix = isCards and "Kartu: " or "Draft: "
-        S.relicStatus = prefix .. table.concat(names, " | ") .. " (" .. tostring(reason) .. ")"
+        setRelicStatus(prefix .. table.concat(names, " | ") .. " (" .. tostring(reason) .. ")")
         if isCards and reason ~= "path manual" and reason ~= "trader manual" then
             print("[DelveFarm] relic: card skipped (" .. tostring(reason) .. ")")
         end
@@ -1879,14 +2389,14 @@ local function onRelicOffer(offer)
 
     local delayValue = isAscend and CFG.ascendDelay or CFG.relicDelay
     local delay = math.clamp(tonumber(delayValue) or 0, 0, 2)
-    S.relicStatus = string.format(
+    setRelicStatus(string.format(
         "%s: %s. Memilih %s (%s) dalam %.2fs.",
         isAscend and "Ascend" or "Draft",
         table.concat(names, " | "),
         label,
         reason,
         delay
-    )
+    ))
 
     local ends = tonumber(offer.ends) or 0
     task.delay(delay, function()
@@ -1894,19 +2404,19 @@ local function onRelicOffer(offer)
             return
         end
         if ends > 0 and workspace:GetServerTimeNow() > ends then
-            S.relicStatus = "Draft lewat batas waktu, batal memilih."
+            setRelicStatus("Draft lewat batas waktu, batal memilih.")
             return
         end
         local gui = plr.PlayerGui:FindFirstChild("RelicDraft")
         if gui and gui:IsA("ScreenGui") and not gui.Enabled then
-            S.relicStatus = "Draft sudah ditutup (mungkin dipilih manual)."
+            setRelicStatus("Draft sudah ditutup (mungkin dipilih manual).")
             return
         end
         local ok = pcall(function()
             relicPickRemote:FireServer(index)
         end)
         if not ok then
-            S.relicStatus = "Gagal mengirim PickRelic."
+            setRelicStatus("Gagal mengirim PickRelic.")
             return
         end
         if gui and gui:IsA("ScreenGui") then
@@ -1917,12 +2427,12 @@ local function onRelicOffer(offer)
         if isAscend then
             S.ascendPicks = S.ascendPicks + 1
             S.ascendLast = label
-            S.relicStatus = string.format("Ascend terpilih: %s.", label)
+            setRelicStatus(string.format("Ascend terpilih: %s.", label))
             print("[DelveFarm] ascend: " .. label)
         else
             S.relicPicks = S.relicPicks + 1
             S.relicLast = label
-            S.relicStatus = string.format("Terpilih: %s (%s).", label, reason)
+            setRelicStatus(string.format("Terpilih: %s (%s).", label, reason))
             print("[DelveFarm] relic: " .. label .. " (" .. reason .. ")")
         end
     end)
@@ -1943,6 +2453,12 @@ local function relicStatusText()
         lines[#lines + 1] = table.concat(names, ", ") .. more
     end
     lines[#lines + 1] = "Dipilih otomatis: " .. tostring(S.relicPicks)
+    local setNames = {}
+    for _, id in ipairs(S.relicSetOrder) do
+        local info = relicSetDefs[id]
+        setNames[#setNames + 1] = info and info.name or string.upper(id)
+    end
+    lines[#lines + 1] = "Set: " .. (#setNames > 0 and table.concat(setNames, ", ") or "Off")
     lines[#lines + 1] = "Path: " .. (PATH_LABELS[CFG.pathPick] or "Manual")
     local traderLine = "Trader: " .. (TRADER_LABELS[CFG.traderMode] or "Manual")
     if CFG.traderMode ~= "manual" and (tonumber(CFG.traderMaxPrice) or 0) > 0 then
@@ -1966,13 +2482,17 @@ local function relicStatusText()
     return table.concat(lines, "\n")
 end
 
-local function refreshRelicStatus()
-    if not S.relicCard then
-        return
+function refreshRelicStatus()
+    if S.relicCard then
+        pcall(function()
+            S.relicCard:SetContent(relicStatusText())
+        end)
     end
-    pcall(function()
-        S.relicCard:SetContent(relicStatusText())
-    end)
+    if S.relicSetCard then
+        pcall(function()
+            S.relicSetCard:SetContent(relicSetInfoText())
+        end)
+    end
 end
 
 buildRelicOptions()
@@ -2908,7 +3428,7 @@ local function mineStep(hrp, hum)
 end
 
 function fightStep(mob, hrp, hum)
-    local pp = mob.PrimaryPart
+    local pp = mob.PrimaryPart or mob:FindFirstChildWhichIsA("BasePart")
     if not pp or not mob.Parent then
         return
     end
@@ -3004,6 +3524,9 @@ local function tick()
         S.lastWorldId = session.worldId
     end
     pumpEquip()
+    if triggerStep(hrp) then
+        return
+    end
     if chestStep(hrp, hum) then
         return
     end
@@ -3173,6 +3696,7 @@ function api.Start()
     S.chestAt = 0
     S.chestFound = nil
     installGuard()
+    startTriggerWatch()
     syncToggle(true)
 end
 
@@ -3207,6 +3731,7 @@ function api.Stop()
     S.pendingSwing = nil
     releaseAim()
     chestAbort()
+    stopTriggerWatch()
     uninstallGuard()
     syncToggle(false)
 end
@@ -3281,6 +3806,39 @@ function api.SetCenterMine(on)
         end)
     end
     return CFG.centerMine
+end
+
+function api.SetBossHelpers(on)
+    CFG.bossHelpers = on and true or false
+    if S.bossHelpersToggle then
+        pcall(function()
+            S.bossHelpersToggle:Set(CFG.bossHelpers, true)
+        end)
+    end
+    return CFG.bossHelpers
+end
+
+function api.SetBossFocus(on)
+    CFG.bossFocus = on and true or false
+    if S.bossFocusToggle then
+        pcall(function()
+            S.bossFocusToggle:Set(CFG.bossFocus, true)
+        end)
+    end
+    return CFG.bossFocus
+end
+
+function api.SetBossTrigger(on)
+    CFG.bossTrigger = on and true or false
+    if S.bossTriggerToggle then
+        pcall(function()
+            S.bossTriggerToggle:Set(CFG.bossTrigger, true)
+        end)
+    end
+    if CFG.bossTrigger then
+        startTriggerWatch()
+    end
+    return CFG.bossTrigger
 end
 
 function api.SetLoadoutAuto(on)
@@ -3360,6 +3918,38 @@ function api.GetRelicPriority()
     local out = {}
     for i, id in ipairs(S.relicOrder) do
         out[i] = { id = id, name = relicName(id) }
+    end
+    return out
+end
+
+function api.SetRelicSets(list)
+    setRelicSets(list)
+    if S.relicSetDropdown then
+        local labels = {}
+        for _, id in ipairs(S.relicSetOrder) do
+            local label = relicSetIdToLabel[id]
+            if label then
+                labels[#labels + 1] = label
+            end
+        end
+        pcall(function()
+            S.relicSetDropdown:Set(labels, true)
+        end)
+    end
+    saveRelicPrefs()
+    refreshRelicStatus()
+    return true
+end
+
+function api.SetRelicSet(value)
+    return api.SetRelicSets({ value })
+end
+
+function api.GetRelicSets()
+    local out = {}
+    for i, id in ipairs(S.relicSetOrder) do
+        local info = relicSetDefs[id]
+        out[i] = { id = id, name = info and info.name or string.upper(id) }
     end
     return out
 end
@@ -3797,6 +4387,7 @@ function api.Destroy()
         end)
         S.connIdled = nil
     end
+    stopTriggerWatch()
     if S.connRerunGui then
         pcall(function()
             S.connRerunGui:Disconnect()
@@ -4006,6 +4597,49 @@ local function depthStatusText()
         lines[#lines + 1] = "Status: target tercapai, menunggu keluar"
     end
     return table.concat(lines, "\n")
+end
+
+local function refreshBossCard()
+    if not S.bossCard then
+        return
+    end
+    local now = os.clock()
+    if now - S.bossAt > 0.5 then
+        S.mobs = scanMobs()
+        S.mobsAt = now
+        refreshBossTargets()
+        S.bossAt = now
+    end
+    local lines = {}
+    local boss = S.boss
+    if boss and boss.Parent then
+        local title = boss:GetAttribute("BossTitle") or boss.Name
+        local hum = boss:FindFirstChildOfClass("Humanoid")
+        local hp = hum and hum.Health or 0
+        local max = hum and hum.MaxHealth or 0
+        local pct = max > 0 and (hp / max * 100) or 0
+        lines[#lines + 1] = string.format("%s - %.1f%% HP", tostring(title), pct)
+        if boss:GetAttribute("Airborne") == true or boss:GetAttribute("aloft") == true then
+            lines[#lines + 1] = "Boss airborne: adds are targeted until it lands."
+        end
+    else
+        lines[#lines + 1] = "No boss detected."
+    end
+    lines[#lines + 1] = string.format("Helpers alive: %d", #S.bossHelpersList)
+    if #S.bossHelpersList > 0 then
+        local names = {}
+        for i = 1, math.min(#S.bossHelpersList, 4) do
+            names[#names + 1] = S.bossHelpersList[i].Name
+        end
+        lines[#lines + 1] = "Priority: " .. table.concat(names, ", ")
+    elseif CFG.bossFocus then
+        lines[#lines + 1] = "Priority: real boss (trigger phase)"
+    end
+    lines[#lines + 1] = "Helpers first: " .. (CFG.bossHelpers and "ON" or "OFF")
+    lines[#lines + 1] = "Auto trigger: " .. (CFG.bossTrigger and "ON" or "OFF")
+    pcall(function()
+        S.bossCard:SetContent(table.concat(lines, "\n"))
+    end)
 end
 
 -- ============================================================
@@ -4233,6 +4867,43 @@ ChestSection:AddToggle({
     end,
 })
 
+local BossSection = FarmTab:CreateSection("Boss Mechanics")
+
+S.bossHelpersToggle = BossSection:AddToggle({
+    Name = "Kill Boss Helpers First",
+    Description = "Heart Pylons (HeartLink heal beam), Marble Sentries, Fragment of Light, and Blackheart Veins are killed before the boss so it stops healing/shielding.",
+    Flag = "DelveBossHelpers",
+    Default = CFG.bossHelpers,
+    Callback = function(on)
+        api.SetBossHelpers(on)
+    end,
+})
+
+S.bossFocusToggle = BossSection:AddToggle({
+    Name = "Focus Real Boss (Trigger Phase)",
+    Description = "Ignores decoys and regular adds and focuses the real boss (the one with the Boss attribute) so its HP reaches the summon/frenzy phase faster. Helpers above are still prioritized.",
+    Flag = "DelveBossFocus",
+    Default = CFG.bossFocus,
+    Callback = function(on)
+        api.SetBossFocus(on)
+    end,
+})
+
+S.bossTriggerToggle = BossSection:AddToggle({
+    Name = "Auto Trigger Prompt",
+    Description = "Fires ProximityPrompt / ClickDetector near the character while in Delve. Use this for gate/spawn triggers that make the next enemies appear faster.",
+    Flag = "DelveBossTrigger",
+    Default = CFG.bossTrigger,
+    Callback = function(on)
+        api.SetBossTrigger(on)
+    end,
+})
+
+S.bossCard = BossSection:AddParagraph({
+    Title = "Boss Status",
+    Content = "No boss detected.",
+})
+
 -- ------------------------------------------------------------
 -- Tab Run
 -- ------------------------------------------------------------
@@ -4310,7 +4981,7 @@ RelicAutoSection:AddToggle({
 
 RelicAutoSection:AddToggle({
     Name = "Highest Rarity Fallback",
-    Description = "If no priority relic is in the draft, pick the highest rarity.",
+    Description = "If no priority relic or target set is in the draft, pick the highest rarity.",
     Flag = "DelveRelicFallback",
     Default = CFG.relicFallback,
     Callback = function(on)
@@ -4381,6 +5052,77 @@ AscendSection:AddSlider({
     end,
 })
 
+local RelicSetSection = RelicTab:CreateSection("Relic Set")
+
+if #relicSetOptions > 0 then
+    S.relicSetDropdown = RelicSetSection:AddDropdown({
+        Name = "Target Relic Set",
+        Description = "Prioritize relics from these sets. Missing pieces are picked first so the set bonus completes. Individual Priority Relics still win.",
+        Options = relicSetOptions,
+        Multi = true,
+        Searchable = true,
+        Flag = "DelveRelicSets",
+        Callback = function(values)
+            if type(values) == "string" then
+                values = { values }
+            end
+            local ids = {}
+            for _, label in ipairs(values or {}) do
+                local id = relicSetLabelToId[label]
+                if id then
+                    ids[#ids + 1] = id
+                end
+            end
+            setRelicSets(ids)
+            saveRelicPrefs()
+            refreshRelicStatus()
+        end,
+    })
+
+    if #S.relicSetOrder > 0 then
+        local labels = {}
+        for _, id in ipairs(S.relicSetOrder) do
+            local label = relicSetIdToLabel[id]
+            if label then
+                labels[#labels + 1] = label
+            end
+        end
+        pcall(function()
+            S.relicSetDropdown:Set(labels, true)
+        end)
+    end
+
+    S.relicSetCard = RelicSetSection:AddParagraph({
+        Title = "Set Progress",
+        Content = "Loading set progress...",
+    })
+    task.defer(function()
+        if S.alive and S.relicSetCard then
+            refreshRelicStatus()
+        end
+    end)
+
+    RelicSetSection:AddButton({
+        Name = "Clear Target Set",
+        Style = "Danger",
+        Callback = function()
+            if S.relicSetDropdown then
+                pcall(function()
+                    S.relicSetDropdown:Set({}, true)
+                end)
+            end
+            setRelicSets({})
+            saveRelicPrefs()
+            refreshRelicStatus()
+        end,
+    })
+else
+    RelicSetSection:AddParagraph({
+        Title = "Relic Set Data",
+        Content = "Strata.Defs.Relics.Archetypes could not be read; the set feature is unavailable.",
+    })
+end
+
 local RelicPickSection = RelicTab:CreateSection("Relic Priority")
 
 if #relicOptions > 0 then
@@ -4433,6 +5175,11 @@ RelicPickSection:AddButton({
         saveRelicPrefs()
         refreshRelicStatus()
     end,
+})
+
+S.relicCard = RelicPickSection:AddParagraph({
+    Title = "Status",
+    Content = relicStatusText(),
 })
 
 local RelicOfferSection = RelicTab:CreateSection("Path & Trader")
@@ -4498,6 +5245,15 @@ RelicOfferSection:AddSlider({
 -- ============================================================
 -- Loop
 -- ============================================================
+
+S.bossThread = task.spawn(function()
+    while S.alive do
+        if S.bossCard then
+            pcall(refreshBossCard)
+        end
+        task.wait(0.5)
+    end
+end)
 
 S.thread = task.spawn(function()
     while S.alive do
