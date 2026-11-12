@@ -76,6 +76,13 @@
         lap berikutnya (prestige) dimulai tanpa perlu jalan manual ke portal.
         Portal ReturnGate milik Vesper Sanctum di hub selalu diabaikan.
         Toggle ada di tab Run > Auto Prestige.
+    18. Auto time save (Delve): clock collapse adalah ETA server terhadap
+        dinding collapse. Saat clock di bawah batas (bawaan 12 detik), hub
+        memindahkan karakter satu baris melewati batas chamber. Transisi
+        chamber me-reset clock ke budget chamber baru (biasanya 50+ detik),
+        jadi run dapat waktu darurat. Ini darurat: batu yang tersisa di
+        chamber lama dilewati dan kedalaman ikut maju. Toggle ada di tab
+        Run > Collapse Time Save.
 
   Catatan protokol (dibaca dari StrataClient.Controllers):
     - MiningInput mengirim StrataNet.Aim:FireServer(x, z, true) lalu Aim(0, 0, false) saat lepas.
@@ -122,6 +129,9 @@
     getgenv().DelveFarm.SetAutoLeave(true/false)
     getgenv().DelveFarm.SetDepthLeave(true/false)
     getgenv().DelveFarm.SetDepthTarget(500)
+    getgenv().DelveFarm.SetTimeSave(true/false, 12)
+    getgenv().DelveFarm.SetTimeSaveBelow(12)
+    getgenv().DelveFarm.TimeSaveNow()
     getgenv().DelveFarm.SetFocusMining(true/false)
     getgenv().DelveFarm.SetBehindFirst(true/false)
     getgenv().DelveFarm.SetCenterMine(true/false)
@@ -217,6 +227,9 @@ local CFG = {
     chestLockTimeout = 40,     -- batas waktu membersihkan wave chest locked
     chestWaveRadius = 240,     -- radius mob wave yang dicari saat chest locked
     chestOpenHold = 0.25,      -- kontak singkat di chest open supaya server sempat mencatat hadiah
+    chestOpenLift = 12,        -- klaim chest dari ketinggian ini di atas titik chest (tidak turun)
+    chestOpenStep = 3,         -- turun bertahap hanya kalau chest belum terbuka
+    chestOpenWait = 0.3,       -- jeda tiap tingkat sebelum turun lagi, detik
     chestCooldown = 8,         -- jeda sebelum chest yang gagal dicoba lagi
 
     -- relic
@@ -247,6 +260,12 @@ local CFG = {
     depthLeave = false,        -- keluar otomatis saat kedalaman mencapai target
     depthLeaveAt = 500,        -- target kedalaman, meter (angka DEPTH di HUD)
     depthLeaveDelay = 0.5,     -- jeda singkat sebelum LeaveRun, detik
+
+    -- time save: saat clock collapse hampir habis, lompat ke chamber berikutnya.
+    -- Transisi chamber me-reset clock collapse, jadi ini menambah waktu darurat.
+    timeSave = false,          -- aktifkan auto time save
+    timeSaveBelow = 12,        -- trigger saat sisa clock di bawah ini, detik
+    timeSaveCooldown = 6,      -- jeda setelah satu lompatan, detik
     leaveCooldown = 3,         -- jeda minimum antar perintah LeaveRun, detik
 
     -- fly / hover
@@ -778,6 +797,8 @@ local S = {
     autoLeaveArmed = false,
     depthLeaveArmed = false,
     depthNow = nil,
+    timeSaveAt = 0,
+    timeSaveChamber = nil,
     runCard = nil,
     depthToggle = nil,
     depthInput = nil,
@@ -816,6 +837,8 @@ local S = {
     chestState = nil,
     chestSince = 0,
     chestClaimUntil = 0,
+    chestLift = nil,
+    chestLiftAt = 0,
     chestAt = 0,
     chestFound = nil,
     chestCooldownUntil = {},
@@ -1265,6 +1288,40 @@ local function chestPoint(chest)
     return pivot.Position + Vector3.new(0, 3.2, 0)
 end
 
+-- Titik klaim di atas chest. Chest tetap terbuka dari ketinggian ini, jadi
+-- karakter tidak perlu turun ke lantai chest untuk mengambil hadiah.
+-- Kalau chest belum terbuka, chestStep menurunkan lift bertahap.
+local function chestClaimPoint(chest)
+    local point = chestPoint(chest)
+    if not point then
+        return nil
+    end
+    local lift = S.chestLift
+    if lift == nil then
+        lift = CFG.chestOpenLift
+    end
+    return point + Vector3.new(0, math.max(lift, 0), 0)
+end
+
+-- Tempatkan karakter di titik klaim di atas chest. Toleransi memakai jarak
+-- horizontal dan vertikal supaya karakter tidak ditarik turun terus-menerus.
+local function chestPerch(hrp, chest, now)
+    local claim = chestClaimPoint(chest)
+    if not claim then
+        return false
+    end
+    local flat = Vector3.new(hrp.Position.X - claim.X, 0, hrp.Position.Z - claim.Z)
+    if flat.Magnitude > CFG.teleportTolerance
+        or math.abs(hrp.Position.Y - claim.Y) > 0.5
+    then
+        pcall(function()
+            hrp.CFrame = CFrame.new(claim)
+        end)
+        S.teleportedAt = now
+    end
+    return true
+end
+
 local function scanChest(hrp)
     local now = os.clock()
     if now - S.chestAt < CFG.chestScan then
@@ -1325,6 +1382,8 @@ local function chestAbort(keepPosition)
     S.chestState = nil
     S.chestSince = 0
     S.chestClaimUntil = 0
+    S.chestLift = nil
+    S.chestLiftAt = 0
 end
 
 local function mobOwned(m)
@@ -1398,7 +1457,7 @@ local function chestStep(hrp, hum)
         if not chest then
             return false
         end
-        local point = chestPoint(chest)
+        local point = chestClaimPoint(chest)
         if not point then
             return false
         end
@@ -1411,7 +1470,10 @@ local function chestStep(hrp, hum)
         S.chestState = chest:GetAttribute("ChestState")
         S.chestSince = now
         S.chestClaimUntil = 0
-        -- Langsung teleport ke chest, termasuk saat state masih locked.
+        S.chestLift = CFG.chestOpenLift
+        S.chestLiftAt = now
+        -- Teleport ke titik di ATAS chest, termasuk saat state masih locked.
+        -- Karakter tidak perlu turun ke lantai chest untuk membuka hadiah.
         pcall(function()
             hrp.CFrame = CFrame.new(point)
         end)
@@ -1429,31 +1491,21 @@ local function chestStep(hrp, hum)
         S.chestSince = now
     end
 
-    local point = chestPoint(chest)
-    if not point then
+    if not chestClaimPoint(chest) then
         chestAbort()
         return false
     end
-    local flat = Vector3.new(hrp.Position.X - point.X, 0, hrp.Position.Z - point.Z)
-    local chestDist = flat.Magnitude
 
     if state == "open" then
-        -- Sentuhan terakhir untuk mengambil hadiah. Kontak hanya sebentar
-        -- supaya server sempat mencatat hadiah, lalu karakter langsung lanjut
-        -- mining tanpa menunggu chest hilang.
+        -- Server sudah membuka chest dan memberi hadiah saat state menjadi
+        -- open. Jangan turun ke lantai chest lagi: cukup selesaikan hold di
+        -- posisi sekarang, lalu langsung lanjut mining.
         if S.chestClaimUntil == 0 then
-            pcall(function()
-                hrp.CFrame = CFrame.new(point)
-            end)
-            S.teleportedAt = now
             S.chestClaimUntil = now + CFG.chestOpenHold
             S.chestTaken = S.chestTaken + 1
             print("[DelveFarm] chest collected (" .. tostring(chest:GetAttribute("ChestRarity")) .. ")")
         end
         if now < S.chestClaimUntil then
-            pcall(function()
-                hrp.CFrame = CFrame.new(point)
-            end)
             return true
         end
         -- Hadiah sudah tercatat: lepas chest di posisi sekarang dan lanjut mining.
@@ -1462,12 +1514,18 @@ local function chestStep(hrp, hum)
     end
 
     if state == "unlocked" then
-        if chestDist > CFG.teleportTolerance then
-            pcall(function()
-                hrp.CFrame = CFrame.new(point)
-            end)
-            S.teleportedAt = now
+        -- Coba klaim dari ketinggian awal. Chest yang belum terbuka diturunkan
+        -- bertahap (12 -> 9 -> 6 -> 3 -> 0) sebagai fallback, jadi normalnya
+        -- karakter tidak perlu turun sama sekali.
+        if S.chestLift == nil then
+            S.chestLift = CFG.chestOpenLift
+            S.chestLiftAt = now
         end
+        if (S.chestLift or 0) > 0 and now - (S.chestLiftAt or 0) >= CFG.chestOpenWait then
+            S.chestLift = math.max((S.chestLift or 0) - CFG.chestOpenStep, 0)
+            S.chestLiftAt = now
+        end
+        chestPerch(hrp, chest, now)
         if now - S.chestSince > CFG.chestTimeout then
             S.chestCooldownUntil[chest] = now + CFG.chestCooldown
             chestAbort()
@@ -1477,11 +1535,16 @@ local function chestStep(hrp, hum)
     end
 
     -- locked: bersihkan wave dulu. Karakter menyerang mob yang muncul,
-    -- lalu kembali ke chest setelah tidak ada mob hidup.
+    -- lalu kembali ke titik klaim di atas chest setelah tidak ada mob hidup.
     if now - S.chestSince > CFG.chestLockTimeout then
         S.chestCooldownUntil[chest] = now + CFG.chestCooldown
         chestAbort()
         return false
+    end
+
+    if S.chestLift == nil then
+        S.chestLift = CFG.chestOpenLift
+        S.chestLiftAt = now
     end
 
     local mob = nearestChestMob(hrp.Position, CFG.chestWaveRadius)
@@ -1511,14 +1574,10 @@ local function chestStep(hrp, hum)
         return true
     end
 
-    -- Tidak ada mob hidup: tunggu di chest sampai server mengubah state.
+    -- Tidak ada mob hidup: tunggu di titik klaim atas chest sampai server
+    -- mengubah state, tanpa turun ke lantai.
     S.mob = nil
-    if chestDist > CFG.teleportTolerance then
-        pcall(function()
-            hrp.CFrame = CFrame.new(point)
-        end)
-        S.teleportedAt = now
-    end
+    chestPerch(hrp, chest, now)
     return true
 end
 
@@ -3992,6 +4051,77 @@ function Prestige.step(hrp)
     return Prestige.enter(portal, deep)
 end
 
+-- Auto time save: clock collapse Delve adalah ETA server terhadap dinding
+-- collapse. Begitu karakter masuk chamber berikutnya, clock di-reset ke budget
+-- chamber baru (lebih besar kalau clock sekarang sudah rendah). Jadi saat
+-- clock hampir habis, teleport satu baris melewati batas chamber untuk
+-- menyegarkan clock. Ini darurat saja: batu yang tersisa di chamber lama
+-- dilewati.
+local function timeSaveStep(hrp, session, force)
+    if not force and (not CFG.timeSave or not S.running or S.paused) then
+        return false
+    end
+    if S.chestBusy then
+        return false
+    end
+    if Prestige.relicDraftOpen() then
+        return false
+    end
+    session = session or delveSession()
+    if not session or session.worldId ~= "delve" or session.active == false then
+        return false
+    end
+    if session.waveKind == "boss" or session.waveKind == "milestone" then
+        return false
+    end
+    local chamber = tonumber(session.chamber)
+    local ends = tonumber(session.chamberEnds)
+    if not chamber or not ends then
+        return false
+    end
+    local now = os.clock()
+    if not force and now < (S.timeSaveAt or 0) + math.max(tonumber(CFG.timeSaveCooldown) or 0, 0) then
+        return false
+    end
+    local left = ends - workspace:GetServerTimeNow()
+    if not force and (left > (tonumber(CFG.timeSaveBelow) or 0) or left < -0.5) then
+        return false
+    end
+    if not DelveShared or type(DelveShared.startOf) ~= "function" then
+        return false
+    end
+    local nextChamber = math.max(math.floor(chamber), 1) + 1
+    local okStart, startRow = pcall(DelveShared.startOf, nextChamber)
+    if not okStart or type(startRow) ~= "number" then
+        return false
+    end
+    -- Satu baris di dalam chamber baru, di lane tengah, supaya transisi
+    -- chamber pasti terbaca server.
+    local row = startRow + 1
+    local lane = centerLaneFor(row)
+    local pos = cellWorld(row, lane)
+    if not pos then
+        return false
+    end
+    local floorY = pos.Y
+    local y = math.max(hrp.Position.Y, floorY + 3.2 + math.max(tonumber(CFG.hoverHeight) or 0, 4))
+    releaseAim()
+    S.rock = nil
+    S.stand = nil
+    S.rockPos = nil
+    S.snappedRock = nil
+    S.centerRow = nil
+    S.mode = nil
+    pcall(function()
+        hrp.CFrame = CFrame.new(Vector3.new(pos.X, y, pos.Z))
+    end)
+    S.teleportedAt = now
+    S.timeSaveAt = now
+    S.timeSaveChamber = chamber
+    print(string.format("[DelveFarm] time save: %.1fs left, lompat ke chamber %d", left, nextChamber))
+    return true
+end
+
 local function tick()
     local ch = plr.Character
     local hum = ch and ch:FindFirstChildOfClass("Humanoid")
@@ -4018,6 +4148,9 @@ local function tick()
         return
     end
     if chestStep(hrp, hum) then
+        return
+    end
+    if timeSaveStep(hrp, session) then
         return
     end
     S.focusKind = delveRoomKind()
@@ -4631,6 +4764,52 @@ function api.SetDepthTarget(meters)
         end)
     end
     return CFG.depthLeaveAt
+end
+
+function api.SetTimeSave(on, below)
+    CFG.timeSave = on and true or false
+    if below ~= nil then
+        api.SetTimeSaveBelow(below)
+    end
+    if not CFG.timeSave then
+        S.timeSaveAt = 0
+        S.timeSaveChamber = nil
+    end
+    if S.timeSaveToggle then
+        pcall(function()
+            S.timeSaveToggle:Set(CFG.timeSave, true)
+        end)
+    end
+    return CFG.timeSave
+end
+
+function api.SetTimeSaveBelow(seconds)
+    local value = tonumber(seconds)
+    if not value then
+        if S.timeSaveInput then
+            pcall(function()
+                S.timeSaveInput:Set(tostring(CFG.timeSaveBelow), true)
+            end)
+        end
+        return false
+    end
+    CFG.timeSaveBelow = math.clamp(math.floor(value + 0.5), 2, 120)
+    if S.timeSaveInput then
+        pcall(function()
+            S.timeSaveInput:Set(tostring(CFG.timeSaveBelow), true)
+        end)
+    end
+    return CFG.timeSaveBelow
+end
+
+function api.TimeSaveNow()
+    local ch = plr.Character
+    local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+    local session = delveSession()
+    if not hrp or not session or session.worldId ~= "delve" then
+        return false
+    end
+    return timeSaveStep(hrp, session, true)
 end
 
 function api.LeaveRun(mode)
@@ -5548,6 +5727,41 @@ S.depthInput = DepthLeaveSection:AddInput({
     Flag = "DelveDepthLeaveAt",
     Callback = function(text)
         api.SetDepthTarget(text)
+    end,
+})
+
+local TimeSaveSection = RunTab:CreateSection("Collapse Time Save")
+
+S.timeSaveToggle = TimeSaveSection:AddToggle({
+    Name = "Auto Time Save (Chamber Skip)",
+    Description = "Requires Auto Farm running. When the delve clock falls below the threshold, the character is teleported "
+        .. "just past the chamber boundary. Crossing into the next chamber resets the collapse clock, so the run gets a "
+        .. "fresh timer. Emergency only: rocks left in the current chamber are skipped.",
+    Default = CFG.timeSave,
+    Flag = "DelveTimeSave",
+    Callback = function(on)
+        api.SetTimeSave(on)
+    end,
+})
+
+S.timeSaveInput = TimeSaveSection:AddInput({
+    Name = "Save Below (seconds)",
+    Description = "Type a number of seconds and press Enter. 12 is a good default; a new chamber usually resets the clock to 50+ seconds.",
+    Default = tostring(CFG.timeSaveBelow),
+    Placeholder = "e.g. 12",
+    Numeric = true,
+    Width = 90,
+    Flag = "DelveTimeSaveBelow",
+    Callback = function(text)
+        api.SetTimeSaveBelow(text)
+    end,
+})
+
+TimeSaveSection:AddButton({
+    Name = "Save Time Now",
+    Description = "Manual test. Teleports past the current chamber boundary once, even if the clock is still high.",
+    Callback = function()
+        api.TimeSaveNow()
     end,
 })
 
