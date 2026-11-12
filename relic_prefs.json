@@ -1,1 +1,1 @@
-{"trader":"relic","path":"cursed","auto":true,"ids":[],"ascend":true,"fallback":true,"traderMax":0,"ascendTo":"farside","sets":["assassin","storm","prospector"],"delay":0.25,"ascendDelay":0.35}
+{"trader":"relic","path":"cursed","auto":true,"ids":[],"ascend":true,"fallback":true,"traderMax":0,"autoPrestige":false,"sets":["assassin","storm","prospector"],"ascendTo":"farside","prestigeDelay":1,"delay":0.25,"ascendDelay":0.35}

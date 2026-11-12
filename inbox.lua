@@ -68,6 +68,14 @@
         Trigger Prompt menembak ProximityPrompt / ClickDetector di dekat
         karakter untuk trigger gate/spawn. Semua ada di tab Farm > Boss
         Mechanics.
+    17. Auto prestige (Delve): setelah Heart membuka cabang Rift dan draft
+        The Hollow / The Heavens dipilih, server menaruh portal Prestige
+        (CollectionService tag "PrestigePortal") di room. Hub mendeteksi
+        portal itu, menunggu draft tertutup, lalu memindahkan karakter ke
+        bagian "Deep" portal dan mengirim sentuhan / prompt. Dengan begitu
+        lap berikutnya (prestige) dimulai tanpa perlu jalan manual ke portal.
+        Portal ReturnGate milik Vesper Sanctum di hub selalu diabaikan.
+        Toggle ada di tab Run > Auto Prestige.
 
   Catatan protokol (dibaca dari StrataClient.Controllers):
     - MiningInput mengirim StrataNet.Aim:FireServer(x, z, true) lalu Aim(0, 0, false) saat lepas.
@@ -102,6 +110,9 @@
     getgenv().DelveFarm.SetRelicSets({ "assassin", "frost" })
     getgenv().DelveFarm.SetAutoAscend(true/false)
     getgenv().DelveFarm.SetAscendTo("hollow" / "farside")
+    getgenv().DelveFarm.SetAutoPrestige(true/false)
+    getgenv().DelveFarm.SetPrestigeDelay(1)
+    getgenv().DelveFarm.PrestigeNow()
     getgenv().DelveFarm.SetPathPick("safe" / "cursed" / "manual")
     getgenv().DelveFarm.SetTraderMode("manual" / "priority" / "relic" / "cheapest", hargaMaks)
     getgenv().DelveFarm.SetLoadoutAuto(true/false)
@@ -220,6 +231,14 @@ local CFG = {
     autoAscend = true,         -- pilih realm otomatis
     ascendTo = "hollow",       -- "hollow" / "farside"
     ascendDelay = 0.35,        -- jeda sebelum mengirim pilihan ascend, detik
+
+    -- auto prestige (Delve): masuk ke portal Prestige setelah draft/Heart
+    autoPrestige = false,      -- deteksi portal Prestige dan masuk otomatis
+    prestigeDelay = 1,         -- tunggu portal terlihat selama ini sebelum masuk, detik
+    prestigeScan = 0.5,        -- jeda scan tag PrestigePortal, detik
+    prestigeRadius = 320,      -- hanya portal sedekat ini dari karakter, stud
+    prestigeHold = 0.65,       -- berapa lama badan ditahan di portal, detik
+    prestigeCooldown = 8,      -- jeda sebelum portal baru dicoba lagi, detik
 
     -- keluar run (StrataNet.LeaveRun)
     leaveMode = "rerun",       -- "rerun" / "hub", tujuan tombol otomatis
@@ -822,6 +841,21 @@ local S = {
     ascendLast = nil,
     ascendToggle = nil,
     ascendDropdown = nil,
+
+    -- auto prestige
+    prestigeToggle = nil,
+    prestigeCard = nil,
+    prestigePortal = nil,      -- model portal Prestige yang sedang terlihat
+    prestigePoint = nil,       -- Vector3 bagian Deep / PrimaryPart portal
+    prestigeSeenAt = 0,
+    prestigeAt = 0,            -- waktu scan tag terakhir
+    prestigeHoldUntil = 0,     -- badan ditahan di portal sampai waktu ini
+    prestigeCooldownUntil = 0,
+    prestigeUsed = {},         -- portal yang sudah dicoba, supaya tidak spam
+    prestigeCount = 0,
+    prestigeLast = nil,
+    prestigeLastAt = 0,
+    prestigeError = nil,
 
     -- equipment set (loadout)
     app = nil,
@@ -1826,6 +1860,8 @@ local function saveRelicPrefs()
             ascend = CFG.autoAscend,
             ascendTo = CFG.ascendTo,
             ascendDelay = CFG.ascendDelay,
+            autoPrestige = CFG.autoPrestige,
+            prestigeDelay = CFG.prestigeDelay,
             ids = S.relicOrder,
             sets = S.relicSetOrder,
         })
@@ -1873,6 +1909,12 @@ local function loadRelicPrefs()
     end
     if type(data.ascendDelay) == "number" then
         CFG.ascendDelay = math.clamp(data.ascendDelay, 0, 2)
+    end
+    if type(data.autoPrestige) == "boolean" then
+        CFG.autoPrestige = data.autoPrestige
+    end
+    if type(data.prestigeDelay) == "number" then
+        CFG.prestigeDelay = math.clamp(data.prestigeDelay, 0, 3)
     end
     local ids = {}
     for _, id in ipairs(data.ids or {}) do
@@ -3511,6 +3553,285 @@ function fightStep(mob, hrp, hum)
     end)
 end
 
+-- ============================================================
+-- Auto prestige (Delve)
+-- ============================================================
+
+-- Semua fungsi prestige disimpan dalam satu tabel supaya tidak menambah
+-- belasan local baru di chunk utama (Luau membatasi 200 local aktif).
+local Prestige = {}
+
+-- Portal prestige memakai CollectionService tag "PrestigePortal" dan punya
+-- bagian bernama "Deep" (titik masuknya). ReturnGate di VesperSanctum juga
+-- memakai tag ini untuk efek portal toko, jadi model itu selalu dilewati.
+function Prestige.isVesperPortal(inst)
+    local sanctum = workspace:FindFirstChild("VesperSanctum")
+    return sanctum ~= nil and inst:IsDescendantOf(sanctum)
+end
+
+-- Game kadang tidak menandai portal baru tepat saat model dibuat. Selain tag,
+-- cek juga model di plate yang punya child "Deep" dan nama portal.
+function Prestige.looksLikePortal(inst)
+    if not inst:IsA("Model") or Prestige.isVesperPortal(inst) then
+        return false
+    end
+    local deep = inst:FindFirstChild("Deep", true)
+    if not deep or not deep:IsA("BasePart") then
+        return false
+    end
+    local name = string.lower(inst.Name)
+    -- Jangan pakai kata "gate"/"rift" saja: model dekorasi gate room juga
+    -- memakai nama itu. Portal prestige yang dikenal bernama ReturnGate.
+    return name == "returngate"
+        or string.find(name, "prestige", 1, true) ~= nil
+        or string.find(name, "portal", 1, true) ~= nil
+end
+
+function Prestige.portalPoint(portal)
+    local deep = portal:FindFirstChild("Deep", true)
+    if deep and deep:IsA("BasePart") then
+        return deep
+    end
+    local primary = portal.PrimaryPart
+    if primary then
+        return primary
+    end
+    return portal:FindFirstChildWhichIsA("BasePart", true)
+end
+
+function Prestige.findPortal(hrp)
+    local now = os.clock()
+    if now - S.prestigeAt < CFG.prestigeScan then
+        local cached = S.prestigePortal
+        if cached and cached.Parent then
+            return cached, S.prestigePoint
+        end
+        return nil, nil
+    end
+    S.prestigeAt = now
+
+    local found
+    local ok, tagged = pcall(function()
+        return game:GetService("CollectionService"):GetTagged("PrestigePortal")
+    end)
+    if ok and type(tagged) == "table" then
+        for _, inst in ipairs(tagged) do
+            if inst.Parent and not Prestige.isVesperPortal(inst) then
+                local point = Prestige.portalPoint(inst)
+                if point then
+                    local d = (point.Position - hrp.Position).Magnitude
+                    if d <= CFG.prestigeRadius then
+                        found = { portal = inst, point = point, distance = d }
+                        break
+                    end
+                end
+            end
+        end
+    end
+
+    if not found then
+        -- Cadangan: portal biasanya model langsung di bawah StrataPlate.
+        -- Jangan scan seluruh plate setiap tick; cukup anak langsungnya.
+        local plate = workspace:FindFirstChild("StrataPlate")
+        if plate then
+            for _, inst in ipairs(plate:GetChildren()) do
+                if Prestige.looksLikePortal(inst) then
+                    local point = Prestige.portalPoint(inst)
+                    if point then
+                        local d = (point.Position - hrp.Position).Magnitude
+                        if d <= CFG.prestigeRadius then
+                            found = { portal = inst, point = point, distance = d }
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if not found then
+        S.prestigePortal = nil
+        S.prestigePoint = nil
+        S.prestigeSeenAt = 0
+        return nil, nil
+    end
+
+    if found.portal ~= S.prestigePortal then
+        S.prestigePortal = found.portal
+        S.prestigePoint = found.point
+        S.prestigeSeenAt = now
+        S.prestigeHoldUntil = 0
+        S.prestigeError = nil
+    elseif not S.prestigePoint or not S.prestigePoint.Parent then
+        S.prestigePoint = found.point
+    end
+    return found.portal, found.point
+end
+
+function Prestige.relicDraftOpen()
+    local pg = plr:FindFirstChildOfClass("PlayerGui")
+    local gui = pg and pg:FindFirstChild("RelicDraft")
+    return gui ~= nil and gui:IsA("ScreenGui") and gui.Enabled == true
+end
+
+function Prestige.cinematicActive()
+    local pg = plr:FindFirstChildOfClass("PlayerGui")
+    if not pg then
+        return false
+    end
+    local rift = pg:FindFirstChild("RiftCinematic")
+    if rift and rift:IsA("ScreenGui") then
+        return true
+    end
+    local keep = pg:FindFirstChild("PrestigeKeep")
+    if keep and keep:IsA("ScreenGui") then
+        return true
+    end
+    local app = getApp()
+    local until_ = app and app.State and tonumber(app.State.cinematicUntil)
+    return until_ ~= nil and os.clock() < until_
+end
+
+function Prestige.fireTriggers(portal, deep)
+    local ch = plr.Character
+    local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+    if not (hrp and deep) then
+        return
+    end
+    if type(firetouchinterest) == "function" then
+        pcall(firetouchinterest, hrp, deep, 0)
+        pcall(firetouchinterest, hrp, deep, 1)
+    end
+    for _, inst in ipairs(portal:GetDescendants()) do
+        if inst:IsA("ProximityPrompt") and inst.Enabled ~= false then
+            pcall(fireproximityprompt, inst)
+        elseif inst:IsA("ClickDetector") then
+            pcall(fireclickdetector, inst)
+        end
+    end
+end
+
+function Prestige.statusText()
+    local lines = {}
+    if S.prestigePortal and not S.prestigePortal.Parent then
+        S.prestigePortal = nil
+        S.prestigePoint = nil
+        S.prestigeSeenAt = 0
+    end
+    lines[#lines + 1] = "Auto Prestige: " .. (CFG.autoPrestige and "aktif" or "mati")
+    lines[#lines + 1] = "Portal: "
+        .. (S.prestigePortal and S.prestigePortal:GetFullName() or "belum terlihat")
+    if S.prestigeError then
+        lines[#lines + 1] = "Error: " .. tostring(S.prestigeError)
+    end
+    if S.prestigeCount > 0 then
+        local ago = math.max(os.clock() - (S.prestigeLastAt or 0), 0)
+        lines[#lines + 1] = string.format("Total masuk: %d (terakhir %.0f detik lalu)", S.prestigeCount, ago)
+        if S.prestigeLast then
+            lines[#lines + 1] = "Terakhir: " .. tostring(S.prestigeLast)
+        end
+    else
+        lines[#lines + 1] = "Total masuk: 0"
+    end
+    lines[#lines + 1] = "Delay: " .. string.format("%.2fs", tonumber(CFG.prestigeDelay) or 0)
+    return table.concat(lines, "\n")
+end
+
+function Prestige.refreshCard()
+    if not S.prestigeCard then
+        return
+    end
+    pcall(function()
+        S.prestigeCard:SetContent(Prestige.statusText())
+    end)
+end
+
+function Prestige.enter(portal, deep)
+    if not (portal and portal.Parent and deep and deep.Parent) then
+        return false
+    end
+    local ch = plr.Character
+    local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+    if not hrp then
+        return false
+    end
+
+    local point = deep.Position + Vector3.new(0, 0.8, 0)
+    S.pendingSwing = nil
+    pcall(function()
+        hrp.CFrame = CFrame.new(point)
+    end)
+    Prestige.fireTriggers(portal, deep)
+    S.teleportedAt = os.clock()
+    S.prestigeHoldUntil = os.clock() + math.max(tonumber(CFG.prestigeHold) or 0.65, 0.1)
+    S.prestigeCooldownUntil = os.clock() + math.max(tonumber(CFG.prestigeCooldown) or 8, 1)
+    S.prestigeUsed[portal] = true
+    S.prestigeCount = S.prestigeCount + 1
+    S.prestigeLast = portal:GetFullName()
+    S.prestigeLastAt = os.clock()
+    S.prestigeError = nil
+    releaseAim()
+    print("[DelveFarm] prestige: masuk portal " .. tostring(portal.Name))
+    Prestige.refreshCard()
+    return true
+end
+
+function Prestige.step(hrp)
+    if not CFG.autoPrestige then
+        return false
+    end
+    local session = delveSession()
+    if not session or session.worldId ~= "delve" then
+        return false
+    end
+    if Prestige.relicDraftOpen() then
+        return false
+    end
+    -- Jangan masuk portal saat boss masih hidup; portal biasanya baru aktif
+    -- setelah room selesai. Ini juga mencegah portal lama mengganggu fight.
+    local boss = S.boss
+    if boss and boss.Parent then
+        local hum = boss:FindFirstChildOfClass("Humanoid")
+        if hum and hum.Health > 0 then
+            return false
+        end
+    end
+    -- Jangan rebutan dengan auto leave kedalaman kalau target sudah tercapai.
+    if CFG.depthLeave then
+        local depth = liveDepthMetres()
+        if depth and depth >= CFG.depthLeaveAt then
+            return false
+        end
+    end
+
+    local portal, deep = Prestige.findPortal(hrp)
+    if not portal or not deep then
+        return false
+    end
+
+    local now = os.clock()
+    if S.prestigeUsed[portal] then
+        if now < S.prestigeHoldUntil then
+            pcall(function()
+                hrp.CFrame = CFrame.new(deep.Position + Vector3.new(0, 0.8, 0))
+            end)
+            Prestige.fireTriggers(portal, deep)
+            return true
+        end
+        return false
+    end
+    if now < S.prestigeCooldownUntil then
+        return false
+    end
+    if now - S.prestigeSeenAt < math.max(tonumber(CFG.prestigeDelay) or 0, 0) then
+        return false
+    end
+
+    -- Tahan badan sebentar di portal sudah dilakukan di Prestige.enter;
+    -- tick berikutnya akan menjaga posisi selama prestigeHoldUntil.
+    return Prestige.enter(portal, deep)
+end
+
 local function tick()
     local ch = plr.Character
     local hum = ch and ch:FindFirstChildOfClass("Humanoid")
@@ -3519,11 +3840,20 @@ local function tick()
         releaseAim()
         return
     end
+    -- Selama cinematic rift / animasi PrestigeKeep, jangan kirim Aim, Swing,
+    -- atau teleport. Server sedang memindahkan karakter ke lap berikutnya.
+    if Prestige.cinematicActive() then
+        releaseAim()
+        return
+    end
     local session = delveSession()
     if session and type(session.worldId) == "string" and session.worldId ~= "" then
         S.lastWorldId = session.worldId
     end
     pumpEquip()
+    if Prestige.step(hrp) then
+        return
+    end
     if triggerStep(hrp) then
         return
     end
@@ -3695,6 +4025,12 @@ function api.Start()
     S.diveUntil = 0
     S.chestAt = 0
     S.chestFound = nil
+    S.prestigePortal = nil
+    S.prestigePoint = nil
+    S.prestigeSeenAt = 0
+    S.prestigeHoldUntil = 0
+    S.prestigeCooldownUntil = 0
+    S.prestigeUsed = {}
     installGuard()
     startTriggerWatch()
     syncToggle(true)
@@ -4022,6 +4358,58 @@ function api.SetAscendTo(value)
     saveRelicPrefs()
     refreshRelicStatus()
     return true
+end
+
+function api.SetAutoPrestige(on)
+    CFG.autoPrestige = on and true or false
+    if not CFG.autoPrestige then
+        S.prestigeHoldUntil = 0
+    end
+    if S.prestigeToggle then
+        pcall(function()
+            S.prestigeToggle:Set(CFG.autoPrestige, true)
+        end)
+    end
+    Prestige.refreshCard()
+    saveRelicPrefs()
+    return CFG.autoPrestige
+end
+
+function api.SetPrestigeDelay(seconds)
+    local value = tonumber(seconds)
+    if not value then
+        return false
+    end
+    CFG.prestigeDelay = math.clamp(value, 0, 3)
+    Prestige.refreshCard()
+    saveRelicPrefs()
+    return CFG.prestigeDelay
+end
+
+function api.PrestigeNow()
+    local ch = plr.Character
+    local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+    local session = delveSession()
+    if not hrp or not session or session.worldId ~= "delve" then
+        S.prestigeError = "bukan run Delve"
+        Prestige.refreshCard()
+        return false
+    end
+    -- Manual: abaikan cooldown dan status "sudah dipakai" supaya tombol tes
+    -- tetap bisa dipakai walau portal yang sama sempat dicoba otomatis.
+    S.prestigeAt = 0
+    local portal, deep = Prestige.findPortal(hrp)
+    if not portal or not deep then
+        S.prestigeError = "portal Prestige tidak ditemukan"
+        Prestige.refreshCard()
+        return false
+    end
+    S.prestigeUsed[portal] = nil
+    S.prestigeCooldownUntil = 0
+    S.prestigeSeenAt = 0
+    local ok = Prestige.enter(portal, deep)
+    Prestige.refreshCard()
+    return ok
 end
 
 function api.SetLeaveMode(value)
@@ -4566,6 +4954,7 @@ end
 local function runStatusText()
     local lines = {}
     lines[#lines + 1] = "Auto: " .. (CFG.autoLeave and "aktif" or "mati")
+    lines[#lines + 1] = "Auto prestige: " .. (CFG.autoPrestige and "aktif" or "mati")
     lines[#lines + 1] = "Tujuan: " .. (LEAVE_LABELS[CFG.leaveMode] or "Rerun")
     if isRunEndVisible() then
         lines[#lines + 1] = "Layar hasil: terbuka"
@@ -4935,6 +5324,47 @@ S.leaveDropdown = AutoLeaveSection:AddDropdown({
     end,
 })
 
+do
+    local PrestigeSection = RunTab:CreateSection("Auto Prestige")
+
+    S.prestigeToggle = PrestigeSection:AddToggle({
+        Name = "Auto Enter Prestige Portal",
+        Description = "Requires Auto Farm running. After the Heart opens the Rift branch (keep Auto Ascend on), waits for the draft to close, then walks into the tagged Prestige portal automatically so the next lap starts without manual input.",
+        Default = CFG.autoPrestige,
+        Flag = "DelveAutoPrestige",
+        Callback = function(on)
+            api.SetAutoPrestige(on)
+        end,
+    })
+
+    PrestigeSection:AddSlider({
+        Name = "Delay Before Entering",
+        Description = "How long the portal must stay visible before the character is moved into it.",
+        Min = 0,
+        Max = 3,
+        Default = CFG.prestigeDelay,
+        Increment = 0.05,
+        Suffix = "s",
+        Flag = "DelvePrestigeDelay",
+        Callback = function(v)
+            api.SetPrestigeDelay(v)
+        end,
+    })
+
+    PrestigeSection:AddButton({
+        Name = "Enter Prestige Portal Now",
+        Description = "Manual test. Uses the portal currently detected in the Delve.",
+        Callback = function()
+            api.PrestigeNow()
+        end,
+    })
+
+    S.prestigeCard = PrestigeSection:AddParagraph({
+        Title = "Prestige Status",
+        Content = Prestige.statusText(),
+    })
+end
+
 local DepthLeaveSection = RunTab:CreateSection("Depth Auto Leave")
 
 S.depthToggle = DepthLeaveSection:AddToggle({
@@ -5250,6 +5680,15 @@ S.bossThread = task.spawn(function()
     while S.alive do
         if S.bossCard then
             pcall(refreshBossCard)
+        end
+        task.wait(0.5)
+    end
+end)
+
+S.prestigeThread = task.spawn(function()
+    while S.alive do
+        if S.prestigeCard then
+            pcall(Prestige.refreshCard)
         end
         task.wait(0.5)
     end
