@@ -76,13 +76,6 @@
         lap berikutnya (prestige) dimulai tanpa perlu jalan manual ke portal.
         Portal ReturnGate milik Vesper Sanctum di hub selalu diabaikan.
         Toggle ada di tab Run > Auto Prestige.
-    18. Auto time save (Delve): clock collapse adalah ETA server terhadap
-        dinding collapse, bukan countdown tetap. Saat chamber SUDAH BERSIH
-        (0 batu tersisa) dan clock di bawah batas, hub memindahkan karakter
-        satu baris melewati batas chamber untuk menyelesaikan crossing darurat.
-        Ini tidak menambah waktu gratis: lompat dengan batu tersisa hanya
-        membuang loot dan tidak me-refresh clock. Toggle ada di tab Run >
-        Collapse Time Save (bawaan mati).
 
   Catatan protokol (dibaca dari StrataClient.Controllers):
     - MiningInput mengirim StrataNet.Aim:FireServer(x, z, true) lalu Aim(0, 0, false) saat lepas.
@@ -129,9 +122,6 @@
     getgenv().DelveFarm.SetAutoLeave(true/false)
     getgenv().DelveFarm.SetDepthLeave(true/false)
     getgenv().DelveFarm.SetDepthTarget(500)
-    getgenv().DelveFarm.SetTimeSave(true/false, 12)
-    getgenv().DelveFarm.SetTimeSaveBelow(12)
-    getgenv().DelveFarm.TimeSaveNow()
     getgenv().DelveFarm.SetFocusMining(true/false)
     getgenv().DelveFarm.SetBehindFirst(true/false)
     getgenv().DelveFarm.SetCenterMine(true/false)
@@ -260,12 +250,6 @@ local CFG = {
     depthLeave = false,        -- keluar otomatis saat kedalaman mencapai target
     depthLeaveAt = 500,        -- target kedalaman, meter (angka DEPTH di HUD)
     depthLeaveDelay = 0.5,     -- jeda singkat sebelum LeaveRun, detik
-
-    -- time save: saat clock collapse hampir habis, lompat ke chamber berikutnya.
-    -- Transisi chamber me-reset clock collapse, jadi ini menambah waktu darurat.
-    timeSave = false,          -- aktifkan auto time save
-    timeSaveBelow = 12,        -- trigger saat sisa clock di bawah ini, detik
-    timeSaveCooldown = 6,      -- jeda setelah satu lompatan, detik
     leaveCooldown = 3,         -- jeda minimum antar perintah LeaveRun, detik
 
     -- fly / hover
@@ -797,8 +781,6 @@ local S = {
     autoLeaveArmed = false,
     depthLeaveArmed = false,
     depthNow = nil,
-    timeSaveAt = 0,
-    timeSaveChamber = nil,
     runCard = nil,
     depthToggle = nil,
     depthInput = nil,
@@ -4051,83 +4033,6 @@ function Prestige.step(hrp)
     return Prestige.enter(portal, deep)
 end
 
--- Auto time save: clock collapse Delve adalah ETA server terhadap dinding
--- collapse, bukan countdown tetap. Saat chamber sudah bersih dan clock hampir
--- habis, teleport satu baris melewati batas chamber untuk menyelesaikan
--- crossing darurat. TIDAK ada free refill: lompat dengan batu tersisa hanya
--- membuang loot dan clock tetap rendah (sudah terbukti di depth 85+).
-local function timeSaveStep(hrp, session, force)
-    if not force and (not CFG.timeSave or not S.running or S.paused) then
-        return false
-    end
-    if S.chestBusy then
-        return false
-    end
-    if Prestige.relicDraftOpen() then
-        return false
-    end
-    session = session or delveSession()
-    if not session or session.worldId ~= "delve" or session.active == false then
-        return false
-    end
-    if session.waveKind == "boss" or session.waveKind == "milestone" then
-        return false
-    end
-    local chamber = tonumber(session.chamber)
-    local ends = tonumber(session.chamberEnds)
-    if not chamber or not ends then
-        return false
-    end
-    -- Hanya lompat kalau chamber sudah bersih. Lompat dengan batu tersisa
-    -- tidak me-refresh clock (ETA collapse dihitung dari posisi dinding), jadi
-    -- hanya membuang loot. Gate ini juga berlaku untuk manual.
-    local rocksLeft = tonumber(session.rocksLeft)
-    if rocksLeft == nil or rocksLeft > 0 then
-        return false
-    end
-    local now = os.clock()
-    if not force and now < (S.timeSaveAt or 0) + math.max(tonumber(CFG.timeSaveCooldown) or 0, 0) then
-        return false
-    end
-    local left = ends - workspace:GetServerTimeNow()
-    if not force and (left > (tonumber(CFG.timeSaveBelow) or 0) or left < -0.5) then
-        return false
-    end
-    if not DelveShared or type(DelveShared.startOf) ~= "function" then
-        return false
-    end
-    local nextChamber = math.max(math.floor(chamber), 1) + 1
-    local okStart, startRow = pcall(DelveShared.startOf, nextChamber)
-    if not okStart or type(startRow) ~= "number" then
-        return false
-    end
-    -- Satu baris di dalam chamber baru, di lane tengah, supaya transisi
-    -- chamber pasti terbaca server.
-    local row = startRow + 1
-    local lane = centerLaneFor(row)
-    local pos = cellWorld(row, lane)
-    if not pos then
-        return false
-    end
-    local floorY = pos.Y
-    local y = math.max(hrp.Position.Y, floorY + 3.2 + math.max(tonumber(CFG.hoverHeight) or 0, 4))
-    releaseAim()
-    S.rock = nil
-    S.stand = nil
-    S.rockPos = nil
-    S.snappedRock = nil
-    S.centerRow = nil
-    S.mode = nil
-    pcall(function()
-        hrp.CFrame = CFrame.new(Vector3.new(pos.X, y, pos.Z))
-    end)
-    S.teleportedAt = now
-    S.timeSaveAt = now
-    S.timeSaveChamber = chamber
-    print(string.format("[DelveFarm] time save: %.1fs left, lompat ke chamber %d", left, nextChamber))
-    return true
-end
-
 local function tick()
     local ch = plr.Character
     local hum = ch and ch:FindFirstChildOfClass("Humanoid")
@@ -4154,9 +4059,6 @@ local function tick()
         return
     end
     if chestStep(hrp, hum) then
-        return
-    end
-    if timeSaveStep(hrp, session) then
         return
     end
     S.focusKind = delveRoomKind()
@@ -4770,52 +4672,6 @@ function api.SetDepthTarget(meters)
         end)
     end
     return CFG.depthLeaveAt
-end
-
-function api.SetTimeSave(on, below)
-    CFG.timeSave = on and true or false
-    if below ~= nil then
-        api.SetTimeSaveBelow(below)
-    end
-    if not CFG.timeSave then
-        S.timeSaveAt = 0
-        S.timeSaveChamber = nil
-    end
-    if S.timeSaveToggle then
-        pcall(function()
-            S.timeSaveToggle:Set(CFG.timeSave, true)
-        end)
-    end
-    return CFG.timeSave
-end
-
-function api.SetTimeSaveBelow(seconds)
-    local value = tonumber(seconds)
-    if not value then
-        if S.timeSaveInput then
-            pcall(function()
-                S.timeSaveInput:Set(tostring(CFG.timeSaveBelow), true)
-            end)
-        end
-        return false
-    end
-    CFG.timeSaveBelow = math.clamp(math.floor(value + 0.5), 2, 120)
-    if S.timeSaveInput then
-        pcall(function()
-            S.timeSaveInput:Set(tostring(CFG.timeSaveBelow), true)
-        end)
-    end
-    return CFG.timeSaveBelow
-end
-
-function api.TimeSaveNow()
-    local ch = plr.Character
-    local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
-    local session = delveSession()
-    if not hrp or not session or session.worldId ~= "delve" then
-        return false
-    end
-    return timeSaveStep(hrp, session, true)
 end
 
 function api.LeaveRun(mode)
@@ -5733,42 +5589,6 @@ S.depthInput = DepthLeaveSection:AddInput({
     Flag = "DelveDepthLeaveAt",
     Callback = function(text)
         api.SetDepthTarget(text)
-    end,
-})
-
-local TimeSaveSection = RunTab:CreateSection("Collapse Time Save")
-
-S.timeSaveToggle = TimeSaveSection:AddToggle({
-    Name = "Auto Time Save (Chamber Skip)",
-    Description = "Requires Auto Farm running. Emergency crossing only: when the chamber is already cleared (0 rocks left) "
-        .. "and the delve clock falls below the threshold, the character is teleported just past the chamber boundary. "
-        .. "It never skips un-mined rocks. Note: the clock is a server ETA, so this does not create free time; it only "
-        .. "finishes a crossing you already earned.",
-    Default = CFG.timeSave,
-    Flag = "DelveTimeSave",
-    Callback = function(on)
-        api.SetTimeSave(on)
-    end,
-})
-
-S.timeSaveInput = TimeSaveSection:AddInput({
-    Name = "Save Below (seconds)",
-    Description = "Type a number of seconds and press Enter. Only used when the current chamber is fully cleared.",
-    Default = tostring(CFG.timeSaveBelow),
-    Placeholder = "e.g. 12",
-    Numeric = true,
-    Width = 90,
-    Flag = "DelveTimeSaveBelow",
-    Callback = function(text)
-        api.SetTimeSaveBelow(text)
-    end,
-})
-
-TimeSaveSection:AddButton({
-    Name = "Save Time Now",
-    Description = "Manual crossing test. Only works when the current chamber is fully cleared (0 rocks left).",
-    Callback = function()
-        api.TimeSaveNow()
     end,
 })
 
