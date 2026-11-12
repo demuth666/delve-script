@@ -46,8 +46,11 @@
         menunggu run selesai.
     12. Fokus mining (Delve): mob di room tambang biasa tidak wajib dibunuh.
         Saat toggle aktif, hub hanya menyerang mob ketika room sekarang adalah
-        gate/boss yang harus dibersihkan untuk membuka tempat berikutnya. Wave
-        chest locked tetap dibersihkan oleh fitur Auto Ambil Chest.
+        gate/boss yang harus dibersihkan untuk membuka tempat berikutnya.
+        Kalau batu di room sudah habis dan masih ada mob hidup (arena /
+        gelombang wajib, biasanya di Rift setelah Heart), mob itu dibersihkan
+        supaya area berikutnya terbuka. Wave chest locked tetap dibersihkan
+        oleh fitur Auto Ambil Chest.
     13. Prioritas batu belakang (Delve): kalau ada batu dengan sel kedalaman
         (sumbu X grid) lebih kecil dari sel pemain, batu itu ditambang dulu
         sebelum batu yang lebih dekat di depan. Toggle ada di tab Farm >
@@ -190,6 +193,8 @@ local CFG = {
     mobScanInterval = 0.25,
     mobDetect = 30,            -- mulai pakai weapon kalau mob sedekat ini
     mobRelease = 42,           -- baru balik ke pickaxe kalau mob sudah lebih jauh
+    gateMobRadius = 220,       -- radius cari guardian di room gate, stud
+    blockedMobRadius = 140,    -- radius cari mob pengunci saat batu sudah habis, stud
     chaseStop = 7,
     equipRetry = 0.35,         -- jeda minimum antar PickaxeOut / WeaponDrawn
 
@@ -671,6 +676,14 @@ local function delveNeedsCombat(session)
         return true
     end
 
+    -- Fase gate adalah sumber kebenaran kedua: server menandai "fight" saat
+    -- guardian gelombang gate masih hidup dan "loot" saat sisa wave dibagikan.
+    -- Ini juga menutup kasus modul Delve gagal dibaca (kind nil).
+    local phase = session.gatePhase
+    if phase == "fight" or phase == "loot" then
+        return true
+    end
+
     local kind = delveRoomKind(session)
     if kind then
         return kind == "gate" or kind == "mob"
@@ -722,6 +735,7 @@ local S = {
     mode = nil,          -- "mine" atau "fight"
     focusKind = nil,     -- jenis room Delve terakhir: "ore" / "gate"
     focusCombat = false, -- hasil terakhir combatWanted()
+    blockCombat = false, -- true = melawan mob yang menahan area (batu sudah habis)
     focusToggle = nil,
     behindToggle = nil,
     centerToggle = nil,
@@ -931,7 +945,9 @@ local function scanMobs()
     local list = {}
     local myRun = plr:GetAttribute("RunId")
     for _, m in ipairs(workspace:GetChildren()) do
-        if m:IsA("Model") and m:GetAttribute("MobId") ~= nil then
+        -- Guardian kadang tidak punya MobId. Game sendiri mendeteksi mob lewat
+        -- atribut Guardian (GateController / AudioController), jadi ikutkan.
+        if m:IsA("Model") and (m:GetAttribute("MobId") ~= nil or m:GetAttribute("Guardian") == true) then
             if m:GetAttribute("Dead") ~= true then
                 local hum = m:FindFirstChildOfClass("Humanoid")
                 local part = m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart")
@@ -1016,8 +1032,9 @@ local function refreshBossTargets()
     S.bossHelpersList = helpers
 end
 
-local function nearestMob(pos)
-    local now = os.clock()
+-- Disimpan di tabel S supaya tidak menambah local baru di chunk utama
+-- (Luau membatasi jumlah local aktif per fungsi).
+function S.refreshMobScan(now)
     if now - S.mobsAt > CFG.mobScanInterval then
         S.mobs = scanMobs()
         S.mobsAt = now
@@ -1028,6 +1045,11 @@ local function nearestMob(pos)
         refreshBossTargets()
         S.bossAt = now
     end
+end
+
+local function nearestMob(pos)
+    local now = os.clock()
+    S.refreshMobScan(now)
 
     -- 1) Pylon/sentry/healer dulu. Selama HeartLink hidup, Worldheart
     --    disembuhkan/disembunyikan; boss tidak akan turun HP dengan benar.
@@ -1053,7 +1075,45 @@ local function nearestMob(pos)
     if S.mode == "fight" then
         radius = CFG.mobRelease
     end
+    if S.blockCombat then
+        -- Mob pengunci area bisa tersebar di seluruh room; jangan berhenti
+        -- menyerang hanya karena target berikutnya di luar radius tempur biasa.
+        radius = math.max(radius, CFG.blockedMobRadius)
+    end
+    -- Room gate: guardian bisa spawn jauh di ujung room. Selama room gate
+    -- belum selesai, cari sampai radius jauh supaya hub tidak diam menunggu
+    -- di area yang belum terbuka.
+    local session = delveSession()
+    local phase = session and session.gatePhase
+    if S.focusKind == "gate" or phase == "fight" or phase == "loot" then
+        radius = math.max(radius, CFG.gateMobRadius)
+    end
     return nearestFromList(S.mobs, pos, radius)
+end
+
+-- Saat batu di room sudah habis tetapi masih ada mob hidup, mob itulah yang
+-- menahan area berikutnya (arena/gelombang wajib, terutama di Rift setelah
+-- Heart). Focus Mining tetap melewati mob di room tambang biasa selama masih
+-- ada batu, jadi mob opsional tidak dikejar.
+function S.blockedCombatWanted(session, hrp)
+    if not CFG.focusMining or not CFG.fight then
+        return false
+    end
+    if not session or session.worldId ~= "delve" or not hrp then
+        return false
+    end
+    local rocks = tonumber(session.rocksLeft)
+    if rocks ~= nil and rocks > 0 then
+        return false
+    end
+    S.refreshMobScan(os.clock())
+    local radius = CFG.blockedMobRadius
+    if rocks == nil then
+        -- rocksLeft tidak terbaca: hanya mob yang benar-benar dekat.
+        radius = math.min(radius, 60)
+    end
+    local mob = nearestFromList(S.mobs, hrp.Position, radius)
+    return mob ~= nil
 end
 
 -- Cache ProximityPrompt / ClickDetector supaya trigger spawn/gate bisa
@@ -4063,6 +4123,11 @@ local function tick()
     end
     S.focusKind = delveRoomKind()
     S.focusCombat = combatWanted()
+    S.blockCombat = false
+    if not S.focusCombat and S.blockedCombatWanted(session, hrp) then
+        S.focusCombat = true
+        S.blockCombat = true
+    end
     if S.focusCombat then
         local mob = nearestMob(hrp.Position)
         S.mob = mob
@@ -5056,7 +5121,9 @@ local function statusText()
         local session = delveSession()
         if session and session.worldId == "delve" then
             local kind = delveRoomKind(session)
-            if delveNeedsCombat(session) then
+            if S.blockCombat then
+                lines[#lines + 1] = "Fokus mining: bersihkan mob pengunci area (batu habis)"
+            elseif delveNeedsCombat(session) then
                 lines[#lines + 1] = "Fokus mining: lawan mob (room " .. (kind or "?") .. ")"
             else
                 lines[#lines + 1] = "Fokus mining: mob dilewati (room " .. (kind or "?") .. ")"
@@ -5305,7 +5372,7 @@ MainSection:AddToggle({
 
 S.focusToggle = MainSection:AddToggle({
     Name = "Focus Mining (Delve)",
-    Description = "In Delve, mobs in normal mining rooms are skipped. The hub only attacks when the current room is a gate/boss that must be cleared to open the next area. Locked chests are still cleared by Auto Collect Chest.",
+    Description = "In Delve, mobs in normal mining rooms are skipped while there are still rocks to mine. The hub fights in gate/boss rooms, and also clears mobs that block the next area when the room's rocks are gone (arena/rift waves). Locked chests are still cleared by Auto Collect Chest.",
     Flag = "DelveFocusMining",
     Default = CFG.focusMining,
     Callback = function(on)
