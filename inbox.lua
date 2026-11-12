@@ -849,7 +849,11 @@ local S = {
     prestigePoint = nil,       -- Vector3 bagian Deep / PrimaryPart portal
     prestigeSeenAt = 0,
     prestigeAt = 0,            -- waktu scan tag terakhir
+    prestigeFallbackAt = 0,    -- waktu scan cadangan (Plates/StrataPlate) terakhir
     prestigeHoldUntil = 0,     -- badan ditahan di portal sampai waktu ini
+    prestigeGroundUntil = 0,   -- sampai waktu ini fly dimatikan dan badan berdiri di lantai portal
+    prestigeLanding = nil,     -- Vector3 titik berdiri di bawah portal
+    prestigeAttemptAt = 0,     -- awal percobaan masuk portal (batas hold)
     prestigeCooldownUntil = 0,
     prestigeUsed = {},         -- portal yang sudah dicoba, supaya tidak spam
     prestigeCount = 0,
@@ -2995,13 +2999,56 @@ local function flyStep(dt)
         flyDisable()
         return
     end
+    local now = os.clock()
+    local pg = plr:FindFirstChildOfClass("PlayerGui")
+    local cinematic = pg ~= nil
+        and (pg:FindFirstChild("RiftCinematic") ~= nil or pg:FindFirstChild("PrestigeKeep") ~= nil)
+    local ground = now < (S.prestigeGroundUntil or 0)
+
+    -- Auto prestige: portal prestige hanya aktif kalau karakter BERDIRI di
+    -- lantai bawah portal. Deep part ada ~9 stud di atas lantai, jadi fly harus
+    -- dimatikan total (bukan cuma Velocity=0) supaya badan jatuh dan menginjak
+    -- lantai. Cinematic juga harus bebas dari BodyVelocity.
+    if ground or cinematic then
+        S.flyTarget = nil
+        if S.flyBv or S.flyBg then
+            flyCleanup()
+        end
+        pcall(function()
+            if hum.PlatformStand then
+                hum.PlatformStand = false
+            end
+            if not hum.AutoRotate then
+                hum.AutoRotate = true
+            end
+        end)
+        return
+    end
+
     if not S.flyBv or S.flyBv.Parent ~= hrp then
         if not flyEnable() then
             return
         end
     end
 
-    local now = os.clock()
+    -- Setelah mendarat, jangan biarkan hover menarik badan keluar dari portal
+    -- selama cooldown masuk portal.
+    local hold = now < (S.prestigeHoldUntil or 0)
+    local prestigePortal = S.prestigePortal
+    local usingPortal = prestigePortal ~= nil
+        and prestigePortal.Parent ~= nil
+        and S.prestigeUsed[prestigePortal] == true
+        and now < (S.prestigeCooldownUntil or 0)
+    if hold or usingPortal then
+        S.flyTarget = nil
+        if S.flyBv then
+            pcall(function()
+                S.flyBv.Velocity = Vector3.zero
+            end)
+        end
+        return
+    end
+
     if S.diveUntil > now and S.divePoint then
         if S.flyBv then
             pcall(function()
@@ -3562,11 +3609,35 @@ end
 local Prestige = {}
 
 -- Portal prestige memakai CollectionService tag "PrestigePortal" dan punya
--- bagian bernama "Deep" (titik masuknya). ReturnGate di VesperSanctum juga
--- memakai tag ini untuk efek portal toko, jadi model itu selalu dilewati.
+-- bagian bernama "Deep" (titik masuknya). Sayangnya gate toko (VesperGate /
+-- ReturnGate di VesperSanctum) juga memakai tag yang sama. Gate toko selalu
+-- dilewati, baik lewat nama maupun lewat parent VesperSanctum.
+function Prestige.isShopGate(inst)
+    local name = string.lower(inst.Name)
+    return string.find(name, "vesper", 1, true) ~= nil
+end
+
 function Prestige.isVesperPortal(inst)
+    if Prestige.isShopGate(inst) then
+        return true
+    end
     local sanctum = workspace:FindFirstChild("VesperSanctum")
     return sanctum ~= nil and inst:IsDescendantOf(sanctum)
+end
+
+-- Prioritas kandidat portal: makin kecil makin dipilih. Model yang namanya
+-- mengandung "prestige" (PrestigePortal) adalah portal lap berikutnya;
+-- ReturnGate generik cadangan; tag lain paling akhir. VesperGate tidak pernah
+-- masuk karena sudah disaring isVesperPortal.
+function Prestige.portalRank(inst)
+    local name = string.lower(inst.Name)
+    if string.find(name, "prestige", 1, true) ~= nil then
+        return 1
+    end
+    if name == "returngate" then
+        return 2
+    end
+    return 3
 end
 
 -- Game kadang tidak menandai portal baru tepat saat model dibuat. Selain tag,
@@ -3575,16 +3646,18 @@ function Prestige.looksLikePortal(inst)
     if not inst:IsA("Model") or Prestige.isVesperPortal(inst) then
         return false
     end
-    local deep = inst:FindFirstChild("Deep", true)
-    if not deep or not deep:IsA("BasePart") then
-        return false
-    end
     local name = string.lower(inst.Name)
     -- Jangan pakai kata "gate"/"rift" saja: model dekorasi gate room juga
-    -- memakai nama itu. Portal prestige yang dikenal bernama ReturnGate.
-    return name == "returngate"
+    -- memakai nama itu. Cek nama dulu supaya tidak menelusuri Deep pada
+    -- ratusan model dekorasi.
+    local named = name == "returngate"
         or string.find(name, "prestige", 1, true) ~= nil
         or string.find(name, "portal", 1, true) ~= nil
+    if not named then
+        return false
+    end
+    local deep = inst:FindFirstChild("Deep", true)
+    return deep ~= nil and deep:IsA("BasePart")
 end
 
 function Prestige.portalPoint(portal)
@@ -3611,39 +3684,62 @@ function Prestige.findPortal(hrp)
     S.prestigeAt = now
 
     local found
+    local bestRank, bestDist
+
+    -- Ambil kandidat terbaik, bukan yang pertama muncul. Gate toko (VesperGate)
+    -- sering ditandai lebih dulu daripada PrestigePortal, jadi urutan tag tidak
+    -- boleh dipakai. Yang dipilih: rank nama terbaik, lalu jarak terdekat.
+    local function consider(inst)
+        if not inst.Parent or Prestige.isVesperPortal(inst) then
+            return
+        end
+        local point = Prestige.portalPoint(inst)
+        if not point then
+            return
+        end
+        local d = (point.Position - hrp.Position).Magnitude
+        if d > CFG.prestigeRadius then
+            return
+        end
+        local rank = Prestige.portalRank(inst)
+        if not found or rank < bestRank or (rank == bestRank and d < bestDist) then
+            found = { portal = inst, point = point, distance = d }
+            bestRank = rank
+            bestDist = d
+        end
+    end
+
     local ok, tagged = pcall(function()
         return game:GetService("CollectionService"):GetTagged("PrestigePortal")
     end)
     if ok and type(tagged) == "table" then
         for _, inst in ipairs(tagged) do
-            if inst.Parent and not Prestige.isVesperPortal(inst) then
-                local point = Prestige.portalPoint(inst)
-                if point then
-                    local d = (point.Position - hrp.Position).Magnitude
-                    if d <= CFG.prestigeRadius then
-                        found = { portal = inst, point = point, distance = d }
-                        break
+            consider(inst)
+        end
+    end
+
+    if not found and now - S.prestigeFallbackAt >= 2 then
+        -- Cadangan kalau portal belum/tidak diberi tag. Plate run sekarang ada
+        -- di Workspace.Plates (StrataPlate hanya dekorasi), jadi cek keduanya.
+        -- Cukup anak langsung plate; looksLikePortal menyaring nama dulu.
+        S.prestigeFallbackAt = now
+        local plates = workspace:FindFirstChild("Plates")
+        if plates then
+            for _, plate in ipairs(plates:GetChildren()) do
+                if plate:IsA("Model") then
+                    for _, inst in ipairs(plate:GetChildren()) do
+                        if Prestige.looksLikePortal(inst) then
+                            consider(inst)
+                        end
                     end
                 end
             end
         end
-    end
-
-    if not found then
-        -- Cadangan: portal biasanya model langsung di bawah StrataPlate.
-        -- Jangan scan seluruh plate setiap tick; cukup anak langsungnya.
         local plate = workspace:FindFirstChild("StrataPlate")
         if plate then
             for _, inst in ipairs(plate:GetChildren()) do
                 if Prestige.looksLikePortal(inst) then
-                    local point = Prestige.portalPoint(inst)
-                    if point then
-                        local d = (point.Position - hrp.Position).Magnitude
-                        if d <= CFG.prestigeRadius then
-                            found = { portal = inst, point = point, distance = d }
-                            break
-                        end
-                    end
+                    consider(inst)
                 end
             end
         end
@@ -3750,20 +3846,61 @@ function Prestige.enter(portal, deep)
     if not (portal and portal.Parent and deep and deep.Parent) then
         return false
     end
+    -- Jangan pernah masuk gate toko Vesper/Sanctum; itu bukan portal prestige.
+    if Prestige.isVesperPortal(portal) then
+        S.prestigeError = "bukan portal prestige: " .. tostring(portal:GetFullName())
+        Prestige.refreshCard()
+        return false
+    end
     local ch = plr.Character
     local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
     if not hrp then
         return false
     end
 
-    local point = deep.Position + Vector3.new(0, 0.8, 0)
+    -- Deep ada di tengah lengkungan, ~9 stud di atas lantai. Server prestige
+    -- hanya bereaksi saat karakter berdiri di lantai bawah portal, jadi cari
+    -- permukaan lantai di kolom yang sama dan mendarat di situ.
+    local landing = deep.Position + Vector3.new(0, 0.8, 0)
+    local okRay, hit = pcall(function()
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = { ch, portal }
+        pcall(function()
+            params.RespectCanCollide = true
+        end)
+        return workspace:Raycast(deep.Position + Vector3.new(0, 5, 0), Vector3.new(0, -60, 0), params)
+    end)
+    if okRay and hit then
+        landing = Vector3.new(deep.Position.X, hit.Position.Y + 3.2, deep.Position.Z)
+    else
+        -- Deep model portal berada ~9 stud di atas lantai; pakai perkiraan ini
+        -- kalau raycast gagal, jangan biarkan karakter menggantung di udara.
+        landing = Vector3.new(deep.Position.X, deep.Position.Y - 8.8, deep.Position.Z)
+    end
+
     S.pendingSwing = nil
+    -- Lepaskan target hover/mining lama supaya fly tidak punya alasan untuk
+    -- menarik badan kembali setelah teleport ke portal.
+    S.mode = nil
+    S.mob = nil
+    S.rock = nil
+    S.stand = nil
+    S.rockPos = nil
+    S.centerRow = nil
+    S.diveUntil = 0
+    S.divePoint = nil
     pcall(function()
-        hrp.CFrame = CFrame.new(point)
+        hrp.CFrame = CFrame.new(landing)
     end)
     Prestige.fireTriggers(portal, deep)
     S.teleportedAt = os.clock()
-    S.prestigeHoldUntil = os.clock() + math.max(tonumber(CFG.prestigeHold) or 0.65, 0.1)
+    S.prestigeLanding = landing
+    S.prestigeAttemptAt = os.clock()
+    -- Fly dimatikan (lihat flyStep) dan badan ditahan di lantai. Butuh ~3 detik
+    -- sebelum server membuka RiftCinematic, jadi beri waktu lega.
+    S.prestigeGroundUntil = os.clock() + 6
+    S.prestigeHoldUntil = os.clock() + 6
     S.prestigeCooldownUntil = os.clock() + math.max(tonumber(CFG.prestigeCooldown) or 8, 1)
     S.prestigeUsed[portal] = true
     S.prestigeCount = S.prestigeCount + 1
@@ -3805,20 +3942,43 @@ function Prestige.step(hrp)
     end
 
     local portal, deep = Prestige.findPortal(hrp)
+    local now = os.clock()
     if not portal or not deep then
+        if now >= (S.prestigeGroundUntil or 0) then
+            S.prestigeLanding = nil
+            S.prestigeAttemptAt = 0
+        end
         return false
     end
 
-    local now = os.clock()
     if S.prestigeUsed[portal] then
-        if now < S.prestigeHoldUntil then
+        if now - (S.prestigeAttemptAt or now) > 25 then
+            -- Portal tidak merespon dalam batas waktu: biarkan karakter tetap
+            -- berdiri sebentar, lalu lepas kunci supaya bisa dicoba lagi.
+            S.prestigeUsed[portal] = nil
+            S.prestigeCooldownUntil = now + 5
+            S.prestigeGroundUntil = now + 5
+            S.prestigeHoldUntil = 0
+            S.prestigeError = "portal tidak merespon, akan dicoba lagi"
+            Prestige.refreshCard()
+            return false
+        end
+        -- Perpanjang masa berdiri di lantai selama portal masih ada. Server
+        -- butuh beberapa detik sebelum membuka RiftCinematic.
+        S.prestigeGroundUntil = math.max(S.prestigeGroundUntil or 0, now + 3)
+        S.prestigeHoldUntil = math.max(S.prestigeHoldUntil or 0, now + 3)
+        local landing = S.prestigeLanding
+        if landing then
+            pcall(function()
+                hrp.CFrame = CFrame.new(landing)
+            end)
+        else
             pcall(function()
                 hrp.CFrame = CFrame.new(deep.Position + Vector3.new(0, 0.8, 0))
             end)
-            Prestige.fireTriggers(portal, deep)
-            return true
         end
-        return false
+        Prestige.fireTriggers(portal, deep)
+        return true
     end
     if now < S.prestigeCooldownUntil then
         return false
