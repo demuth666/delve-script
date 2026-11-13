@@ -186,8 +186,7 @@ local function fetchSource(url)
         local ok, res = pcall(attempt)
         if ok and type(res) == "string" and #res > 1000
             and res:sub(1, 3) ~= "404"
-            and not res:lower():find("<html", 1, true)
-            and not res:lower():find("not found", 1, true) then
+            and res:sub(1, 1) ~= "<" then
             return res
         end
         lastErr = ok and "respons bukan source valid" or res
