@@ -115,6 +115,7 @@
   Pemakaian:
     loadstring(readfile("AIBridge/inbox.lua"))()
     RightShift = sembunyikan / tampilkan window (bawaan BPUI)
+    Versi ringan Android/Delta (tanpa BPUI): AIBridge/arena-lite.lua
     getgenv().DelveFarm.Start() / .Pause() / .Resume() / .Stop() / .Destroy()
     getgenv().DelveFarm.SetFly(true/false) / .ToggleFly()
     getgenv().DelveFarm.SetRelicPriority({ "blast", "echo" })
@@ -341,7 +342,7 @@ if type(BPUI) ~= "table" then
     local message = "[DelveFarm] BPUI gagal dimuat.\n"
         .. "Executor: " .. executorName .. "\n"
         .. "Error: " .. tostring(BPUI_ERR) .. "\n\n"
-        .. "Coba: aktifkan HTTP/loadstring di executor, atau taruh AIBridge/BPUI.lua di folder executor lalu jalankan dari file lokal."
+        .. "Coba: aktifkan HTTP/loadstring di executor, taruh AIBridge/BPUI.lua di folder executor, atau jalankan AIBridge/arena-lite.lua (versi ringan tanpa BPUI untuk Delta/Android)."
     warn(message)
     showStartupError(message)
     return
