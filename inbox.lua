@@ -156,11 +156,168 @@
     - Pause/Resume tersedia lewat console: getgenv().DelveFarm.Pause() / .Resume().
 ]]
 
-local BPUI_OK, BPUI = pcall(function()
-    return loadstring(game:HttpGet("https://raw.githubusercontent.com/bypasshubpremium/BPUINEW/main/BPUI.lua"))()
-end)
-if not BPUI_OK or type(BPUI) ~= "table" then
-    warn("[DelveFarm] failed to load BPUI: " .. tostring(BPUI))
+-- getgenv() tidak selalu ada di executor Android. Pakai _G sebagai cadangan.
+local function safeGenv()
+    local ok, g = pcall(function()
+        return getgenv()
+    end)
+    if ok and type(g) == "table" then
+        return g
+    end
+    return _G
+end
+local GENV = safeGenv()
+
+-- Loader BPUI yang tahan executor mobile:
+--   - coba beberapa metode HTTP (game:HttpGet, HttpGet, request, syn.request)
+--   - coba URL mirror (repo ini dulu, baru repo BPUI asli)
+--   - loadstring dari global maupun getgenv()
+--   - kalau semua gagal, tampilkan error di layar (tidak diam-diam return)
+local function fetchSource(url)
+    local attempts = {
+        function() return game:HttpGet(url) end,
+        function() return game:HttpGetAsync(url) end,
+        function() return HttpGet(url) end,
+        function() return request({ Url = url, Method = "GET" }).Body end,
+        function() return syn.request({ Url = url, Method = "GET" }).Body end,
+    }
+    local lastErr
+    for _, attempt in ipairs(attempts) do
+        local ok, res = pcall(attempt)
+        if ok and type(res) == "string" and #res > 1000
+            and res:sub(1, 3) ~= "404"
+            and not res:lower():find("<html", 1, true)
+            and not res:lower():find("not found", 1, true) then
+            return res
+        end
+        lastErr = ok and "respons bukan source valid" or res
+    end
+    return nil, lastErr
+end
+
+local function compileSource(src)
+    local loader = loadstring or GENV.loadstring or GENV.Loadstring
+    if type(loader) ~= "function" then
+        return nil, "loadstring tidak tersedia di executor ini"
+    end
+    local ok, fn, err = pcall(loader, src)
+    if ok and type(fn) == "function" then
+        return fn
+    end
+    if not ok then
+        return nil, fn
+    end
+    return nil, err or "loadstring gagal"
+end
+
+local function showStartupError(message)
+    pcall(function()
+        local players = game:GetService("Players")
+        local localPlayer = players.LocalPlayer
+        local pg = localPlayer:FindFirstChildOfClass("PlayerGui")
+            or localPlayer:WaitForChild("PlayerGui", 10)
+        if not pg then
+            return
+        end
+        local old = pg:FindFirstChild("DelveFarmStartupError")
+        if old then
+            old:Destroy()
+        end
+        local gui = Instance.new("ScreenGui")
+        gui.Name = "DelveFarmStartupError"
+        gui.ResetOnSpawn = false
+        gui.DisplayOrder = 999999
+        local frame = Instance.new("Frame")
+        frame.Size = UDim2.new(0, 440, 0, 250)
+        frame.Position = UDim2.new(0.5, -220, 0.5, -125)
+        frame.BackgroundColor3 = Color3.fromRGB(18, 18, 24)
+        frame.BorderSizePixel = 0
+        frame.Parent = gui
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 10)
+        corner.Parent = frame
+        local stroke = Instance.new("UIStroke")
+        stroke.Color = Color3.fromRGB(255, 90, 110)
+        stroke.Thickness = 1.5
+        stroke.Parent = frame
+        local title = Instance.new("TextLabel")
+        title.Size = UDim2.new(1, -30, 0, 34)
+        title.Position = UDim2.new(0, 15, 0, 12)
+        title.BackgroundTransparency = 1
+        title.Text = "Delve Hub - gagal start"
+        title.TextColor3 = Color3.fromRGB(255, 120, 140)
+        title.TextSize = 18
+        title.Font = Enum.Font.GothamBold
+        title.TextXAlignment = Enum.TextXAlignment.Left
+        title.Parent = frame
+        local text = Instance.new("TextLabel")
+        text.Size = UDim2.new(1, -30, 0, 150)
+        text.Position = UDim2.new(0, 15, 0, 52)
+        text.BackgroundTransparency = 1
+        text.Text = tostring(message)
+        text.TextColor3 = Color3.fromRGB(230, 230, 240)
+        text.TextSize = 13
+        text.Font = Enum.Font.Code
+        text.TextWrapped = true
+        text.TextYAlignment = Enum.TextYAlignment.Top
+        text.TextXAlignment = Enum.TextXAlignment.Left
+        text.Parent = frame
+        local close = Instance.new("TextButton")
+        close.Size = UDim2.new(0, 100, 0, 28)
+        close.Position = UDim2.new(1, -115, 1, -40)
+        close.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
+        close.Text = "Tutup"
+        close.TextColor3 = Color3.fromRGB(240, 240, 240)
+        close.TextSize = 13
+        close.Font = Enum.Font.GothamMedium
+        close.Parent = frame
+        local c2 = Instance.new("UICorner")
+        c2.CornerRadius = UDim.new(0, 6)
+        c2.Parent = close
+        close.MouseButton1Click:Connect(function()
+            gui:Destroy()
+        end)
+        gui.Parent = pg
+    end)
+end
+
+local BPUI_URLS = {
+    "https://raw.githubusercontent.com/demuth666/delve-script/main/BPUI.lua",
+    "https://cdn.jsdelivr.net/gh/demuth666/delve-script@main/BPUI.lua",
+    "https://raw.githubusercontent.com/bypasshubpremium/BPUINEW/main/BPUI.lua",
+    "https://cdn.jsdelivr.net/gh/bypasshubpremium/BPUINEW@main/BPUI.lua",
+}
+local BPUI = nil
+local BPUI_ERR = nil
+for _, url in ipairs(BPUI_URLS) do
+    local src, fetchErr = fetchSource(url)
+    if src then
+        local fn, compileErr = compileSource(src)
+        if fn then
+            local ok, res = pcall(fn)
+            if ok and type(res) == "table" then
+                BPUI = res
+                break
+            end
+            BPUI_ERR = res
+        else
+            BPUI_ERR = compileErr
+        end
+    else
+        BPUI_ERR = fetchErr
+    end
+end
+if type(BPUI) ~= "table" then
+    local executorName = "?"
+    pcall(function()
+        executorName = tostring(identifyexecutor())
+    end)
+    local message = "[DelveFarm] BPUI gagal dimuat.\n"
+        .. "Executor: " .. executorName .. "\n"
+        .. "Error: " .. tostring(BPUI_ERR) .. "\n\n"
+        .. "Coba: aktifkan HTTP/loadstring di executor, atau taruh AIBridge/BPUI.lua di folder executor lalu jalankan dari file lokal."
+    warn(message)
+    showStartupError(message)
     return
 end
 
@@ -747,6 +904,56 @@ local function isInArena()
     return plr:GetAttribute("InArena") == true
 end
 
+-- Cadangan untuk executor mobile yang tidak punya filtergc: baca status
+-- arena dari HUD game. MobRushController membuat tombol "RushButton" di HUD
+-- saat pintu terbuka, dan HUD DepthLine berisi teks "ARENA - WAVE x/y".
+local function arenaHudState()
+    local pg = plr:FindFirstChildOfClass("PlayerGui")
+    local hud = pg and pg:FindFirstChild("HUD")
+    if not hud then
+        return nil
+    end
+
+    local rush = hud:FindFirstChild("RushButton", true)
+    if rush and rush.Visible == true then
+        local label = rush:FindFirstChild("Label", true)
+        local text = label and label:IsA("TextLabel") and label.Text or ""
+        local joined = string.find(string.lower(text), "joined", 1, true) ~= nil
+        return {
+            phase = "open",
+            joined = joined,
+            _fromHud = true,
+            _text = text,
+        }
+    end
+
+    if isInArena() then
+        local runEnd = pg and pg:FindFirstChild("RunEnd")
+        local phase = (runEnd and runEnd.Enabled) and "over" or "running"
+        local wave, of
+        local depthLine = hud:FindFirstChild("DepthLine", true)
+        if depthLine and depthLine:IsA("TextLabel") then
+            local a, b = depthLine.Text:match("WAVE%s*<font[^>]*>(%d+)</font>%s*/%s*(%d+)")
+            if not a then
+                a, b = depthLine.Text:match("WAVE%s*(%d+)%s*/%s*(%d+)")
+            end
+            if a then
+                wave = tonumber(a)
+                of = tonumber(b)
+            end
+        end
+        return {
+            phase = phase,
+            joined = true,
+            wave = wave,
+            of = of,
+            _fromHud = true,
+        }
+    end
+
+    return nil
+end
+
 local function arenaState()
     local app = getApp()
     local controllers = app and app.Controllers
@@ -755,7 +962,7 @@ local function arenaState()
     if type(state) == "table" then
         return state
     end
-    return nil
+    return arenaHudState()
 end
 
 -- Kenapa mob arena dulu tidak diserang: nearestMob hanya mencari dalam
@@ -5567,7 +5774,9 @@ local function arenaPulse()
     -- 1) Daftar otomatis saat pintu terbuka.
     if CFG.arenaJoin and not S.inArena and st and st.phase == "open" and st.joined ~= true then
         local session = delveSession()
-        local inRun = session ~= nil and session.active ~= false
+        -- isInRun() memakai StrataPlate, jadi tetap bekerja di executor
+        -- mobile yang tidak bisa membaca app.State.session.
+        local inRun = isInRun() or (session ~= nil and session.active ~= false)
         if inRun then
             if CFG.arenaLeaveRun and now - S.arenaLastLeaveRun >= 10 then
                 S.arenaLastLeaveRun = now
@@ -5631,19 +5840,19 @@ function api.Destroy()
         end)
         S.connRerunGui = nil
     end
-    if getgenv().DelveFarm == api then
-        getgenv().DelveFarm = nil
+    if GENV.DelveFarm == api then
+        GENV.DelveFarm = nil
     end
 end
 
 api.Config = CFG
 api.State = S
 
-local previous = getgenv().DelveFarm
+local previous = GENV.DelveFarm
 if type(previous) == "table" and type(previous.Destroy) == "function" then
     pcall(previous.Destroy)
 end
-getgenv().DelveFarm = api
+GENV.DelveFarm = api
 
 S.connChar = plr.CharacterAdded:Connect(function(char)
     S.rock = nil
