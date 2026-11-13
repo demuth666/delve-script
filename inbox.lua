@@ -79,6 +79,14 @@
         lap berikutnya (prestige) dimulai tanpa perlu jalan manual ke portal.
         Portal ReturnGate milik Vesper Sanctum di hub selalu diabaikan.
         Toggle ada di tab Run > Auto Prestige.
+    18. Auto arena (MobRush): arena di hub dibuka berkala. Tab Arena bisa
+        mendaftar otomatis saat fase "open" lewat StrataNet.MobRushJoin,
+        menyerang semua mob arena tanpa memakai filter Focus Mining, dan
+        memperlebar radius target sampai CFG.arenaRadius supaya mob yang
+        spawn jauh / tersebar tidak lagi dilewati. Mob yang tidak mau
+        diserang bisa ditulis di kolom Skip Mobs (nama atau MobKind).
+        Kalau arena selesai, karakter bisa keluar otomatis lewat
+        StrataNet.ArenaLeave. Auto arena menyalakan Auto Farm saat aktif.
 
   Catatan protokol (dibaca dari StrataClient.Controllers):
     - MiningInput mengirim StrataNet.Aim:FireServer(x, z, true) lalu Aim(0, 0, false) saat lepas.
@@ -133,6 +141,15 @@
     getgenv().DelveFarm.SetBossTrigger(true/false)
     getgenv().DelveFarm.SetAntiAfk(true/false)
     getgenv().DelveFarm.AntiAfkPulse()
+    getgenv().DelveFarm.SetAutoArena(true/false)
+    getgenv().DelveFarm.SetArenaJoin(true/false)
+    getgenv().DelveFarm.SetArenaFight(true/false)
+    getgenv().DelveFarm.SetArenaLeave(true/false)
+    getgenv().DelveFarm.SetArenaLeaveRun(true/false)
+    getgenv().DelveFarm.SetArenaRadius(320)
+    getgenv().DelveFarm.SetArenaSkip("archer, netcaster")
+    getgenv().DelveFarm.JoinArena()
+    getgenv().DelveFarm.LeaveArena()
 
   Catatan:
     - Auto Farm sengaja mulai dalam keadaan mati. Nyalakan lewat toggle di tab Farm.
@@ -173,6 +190,18 @@ local CFG = {
     autoEquip = true,
     chase = true,
     focusMining = true,        -- Delve: mob hanya dilawan di room gate/boss
+
+    -- arena (MobRush di hub)
+    arena = false,             -- master auto arena, menyalakan Auto Farm saat aktif
+    arenaJoin = true,          -- daftar otomatis saat pintu arena terbuka
+    arenaFight = true,         -- lawan semua mob arena (tanpa filter Focus Mining)
+    arenaLeave = false,        -- keluar otomatis setelah arena selesai
+    arenaLeaveRun = false,     -- keluar run Delve otomatis supaya bisa ikut arena
+    arenaRadius = 320,         -- radius target mob arena, stud
+    arenaJoinCooldown = 5,     -- jeda antar MobRushJoin, detik
+    arenaLeaveCooldown = 12,   -- jeda antar ArenaLeave, detik
+    arenaLeaveDelay = 4,       -- tunggu sebentar sebelum keluar setelah arena selesai
+    arenaSkip = "",            -- nama / MobKind yang dilewati, pisah koma
 
     -- anti AFK
     antiAfk = true,            -- cegah kick idle Roblox lewat sinyal Idled
@@ -349,6 +378,16 @@ local endSessionRemote = net:FindFirstChild("EndSession")
 local startSessionRemote = net:FindFirstChild("StartSession")
 if not leaveRunRemote then
     warn("[DelveFarm] LeaveRun not found, leave run feature disabled.")
+end
+
+-- Arena (MobRush). MobRushJoin dipakai tombol JOIN ARENA di HUD;
+-- ArenaLeave dipakai tombol LEAVE di dalam arena.
+local arenaJoinRemote = net:FindFirstChild("MobRushJoin")
+local arenaLeaveRemote = net:FindFirstChild("ArenaLeave")
+if not arenaJoinRemote then
+    CFG.arenaJoin = false
+    CFG.arena = false
+    warn("[DelveFarm] MobRushJoin not found, auto arena join disabled.")
 end
 
 -- Ringkasan run (SummaryController) hanya bisa dipanggil lewat tabel controller
@@ -701,9 +740,34 @@ local function focusMiningActive(session)
     return session ~= nil and session.worldId == "delve"
 end
 
+-- Arena (MobRush) berjalan di hub, bukan di dalam sesi Delve. Selama
+-- InArena aktif, Focus Mining tidak boleh melewati mob: semua mob arena
+-- menahan wave berikutnya. State wave dibaca dari MobRushController.
+local function isInArena()
+    return plr:GetAttribute("InArena") == true
+end
+
+local function arenaState()
+    local app = getApp()
+    local controllers = app and app.Controllers
+    local ctrl = controllers and controllers.MobRushController
+    local state = ctrl and ctrl.state
+    if type(state) == "table" then
+        return state
+    end
+    return nil
+end
+
+-- Kenapa mob arena dulu tidak diserang: nearestMob hanya mencari dalam
+-- radius mobDetect/mobRelease (30/42 stud). Mob arena sering spawn atau
+-- tersebar jauh dari karakter, jadi wave tidak pernah selesai. Saat
+-- arenaFight aktif, jarak target diperlebar ke CFG.arenaRadius.
 local function combatWanted(session)
     if not CFG.fight then
         return false
+    end
+    if isInArena() and CFG.arenaFight then
+        return true
     end
     if not focusMiningActive(session) then
         return true
@@ -736,6 +800,37 @@ local S = {
     focusKind = nil,     -- jenis room Delve terakhir: "ore" / "gate"
     focusCombat = false, -- hasil terakhir combatWanted()
     blockCombat = false, -- true = melawan mob yang menahan area (batu sudah habis)
+
+    -- arena (MobRush)
+    inArena = false,
+    arenaSt = nil,             -- state MobRushController terakhir
+    arenaPhase = nil,          -- idle / open / running / over
+    arenaWave = 0,
+    arenaOf = 0,
+    arenaLeft = 0,
+    arenaAct = nil,
+    arenaActTitle = nil,
+    arenaUber = false,
+    arenaJoined = false,
+    arenaLastJoin = 0,
+    arenaLastLeave = 0,
+    arenaLastLeaveRun = 0,
+    arenaLeaveAt = 0,
+    arenaJoinCount = 0,
+    arenaLeaveCount = 0,
+    arenaAlive = 0,
+    arenaNearest = nil,
+    arenaError = nil,
+    arenaStartedFarm = false,
+    fightToggle = nil,
+    arenaToggle = nil,
+    arenaJoinToggle = nil,
+    arenaFightToggle = nil,
+    arenaLeaveToggle = nil,
+    arenaLeaveRunToggle = nil,
+    arenaRadiusSlider = nil,
+    arenaSkipInput = nil,
+    arenaCard = nil,
     focusToggle = nil,
     behindToggle = nil,
     centerToggle = nil,
@@ -943,18 +1038,137 @@ end
 
 local function scanMobs()
     local list = {}
+    local seen = {}
     local myRun = plr:GetAttribute("RunId")
-    for _, m in ipairs(workspace:GetChildren()) do
+    local inArena = isInArena()
+    local arenaRadius = tonumber(CFG.arenaRadius) or 320
+    local ch = plr.Character
+    local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+    local base = hrp and hrp.Position
+
+    -- Daftar mob yang sengaja dilewati (nama model atau atribut MobKind).
+    local skipTokens = {}
+    if inArena then
+        local skipText = string.lower(tostring(CFG.arenaSkip or ""))
+        for token in string.gmatch(skipText, "[^,]+") do
+            token = token:match("^%s*(.-)%s*$")
+            if token ~= "" then
+                skipTokens[#skipTokens + 1] = token
+            end
+        end
+    end
+
+    local function skipped(m)
+        if #skipTokens == 0 then
+            return false
+        end
+        local hay = string.lower(m.Name .. " " .. tostring(m:GetAttribute("MobKind") or ""))
+        for _, token in ipairs(skipTokens) do
+            if string.find(hay, token, 1, true) then
+                return true
+            end
+        end
+        return false
+    end
+
+    local function consider(m)
+        if not m:IsA("Model") or seen[m] then
+            return
+        end
         -- Guardian kadang tidak punya MobId. Game sendiri mendeteksi mob lewat
         -- atribut Guardian (GateController / AudioController), jadi ikutkan.
-        if m:IsA("Model") and (m:GetAttribute("MobId") ~= nil or m:GetAttribute("Guardian") == true) then
-            if m:GetAttribute("Dead") ~= true then
-                local hum = m:FindFirstChildOfClass("Humanoid")
-                local part = m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart")
-                if part and (not hum or hum.Health > 0) then
-                    local mobRun = m:GetAttribute("RunId")
-                    if myRun == nil or mobRun == nil or mobRun == myRun then
-                        table.insert(list, m)
+        local mobId = m:GetAttribute("MobId")
+        local guardian = m:GetAttribute("Guardian") == true
+        local runId = m:GetAttribute("RunId")
+        local runText = type(runId) == "string" and string.lower(runId) or ""
+        local arenaTagged = inArena and string.find(runText, "arena", 1, true) ~= nil
+
+        -- Mob arena bisa tidak punya MobId/Guardian. Selama InArena, terima
+        -- model ber-Humanoid di sekitar arena (bukan karakter pemain) supaya
+        -- add/summon yang tidak ditandai tetap diserang.
+        local nearArena = false
+        if inArena and base then
+            local part = m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart")
+            -- Hanya rig mob (punya HumanoidRootPart). Model arena seperti
+            -- BossArena / Floor / Spawns juga bisa punya Humanoid dan dulu
+            -- ikut terpilih sebagai target.
+            nearArena = part ~= nil
+                and m:FindFirstChild("HumanoidRootPart") ~= nil
+                and (part.Position - base).Magnitude <= (arenaRadius + 60)
+        end
+
+        if Players:GetPlayerFromCharacter(m) ~= nil then
+            return
+        end
+        -- Jangan ikut menyerang chest, tombstone, atau dekorasi yang kebetulan
+        -- punya Humanoid. Filter nama hanya saat di arena supaya guardian
+        -- gate di Delve (mis. nama mengandung "gate") tidak ikut tersaring.
+        if inArena then
+            local lowerName = string.lower(m.Name)
+            if lowerName == "bossarena"
+                or lowerName == "floor"
+                or lowerName == "boundary"
+                or lowerName == "spawns"
+                or lowerName == "colosseum"
+                or lowerName == "floorlights"
+                or lowerName:find("chest", 1, true) ~= nil
+                or lowerName:find("tomb", 1, true) ~= nil
+                or lowerName:find("vase", 1, true) ~= nil
+                or lowerName:find("dummy", 1, true) ~= nil
+                or lowerName:find("gate", 1, true) ~= nil
+                or lowerName:find("portal", 1, true) ~= nil
+                or m:GetAttribute("ChestState") ~= nil
+                or m:GetAttribute("ChestRarity") ~= nil then
+                return
+            end
+        end
+        if mobId == nil and not guardian and not arenaTagged and not nearArena then
+            return
+        end
+        if skipped(m) or m:GetAttribute("Dead") == true then
+            return
+        end
+
+        local hum = m:FindFirstChildOfClass("Humanoid")
+        local part = m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart")
+        if not part or (hum and hum.Health <= 0) then
+            return
+        end
+        if inArena and base
+            and (part.Position - base).Magnitude > (arenaRadius + 60) then
+            -- Mob dari plate/run lain di workspace yang sama tidak ikut
+            -- dihitung sebagai mob arena.
+            return
+        end
+
+        local mobRun = m:GetAttribute("RunId")
+        if arenaTagged or myRun == nil or mobRun == nil or mobRun == myRun then
+            seen[m] = true
+            table.insert(list, m)
+        end
+    end
+
+    for _, m in ipairs(workspace:GetChildren()) do
+        consider(m)
+    end
+
+    -- Arena kadang menaruh add di bawah BossArena/Spawns/Holder. Scan
+    -- container itu saja (bukan seluruh descendant) supaya tetap ringan.
+    if inArena then
+        local bossArena = workspace:FindFirstChild("BossArena")
+        if bossArena then
+            for _, m in ipairs(bossArena:GetChildren()) do
+                consider(m)
+            end
+            local spawns = bossArena:FindFirstChild("Spawns")
+            if spawns then
+                for _, m in ipairs(spawns:GetChildren()) do
+                    consider(m)
+                end
+                local holder = spawns:FindFirstChild("Holder")
+                if holder then
+                    for _, m in ipairs(holder:GetChildren()) do
+                        consider(m)
                     end
                 end
             end
@@ -1079,6 +1293,11 @@ local function nearestMob(pos)
         -- Mob pengunci area bisa tersebar di seluruh room; jangan berhenti
         -- menyerang hanya karena target berikutnya di luar radius tempur biasa.
         radius = math.max(radius, CFG.blockedMobRadius)
+    end
+    if isInArena() and CFG.arenaFight then
+        -- Arena: mob spawn di seluruh arena. Radius tempur biasa (30/42)
+        -- membuat mob yang jauh tidak pernah dikejar dan wave macet.
+        radius = math.max(radius, tonumber(CFG.arenaRadius) or 320)
     end
     -- Room gate: guardian bisa spawn jauh di ujung room. Selama room gate
     -- belum selesai, cari sampai radius jauh supaya hub tidak diam menunggu
@@ -5012,6 +5231,370 @@ function api.LeaveRun(mode)
     return true
 end
 
+-- ============================================================
+-- Arena (MobRush)
+-- ============================================================
+
+local function arenaPhaseLabel(phase)
+    if phase == "open" then
+        return "pintu terbuka"
+    elseif phase == "running" then
+        return "berjalan"
+    elseif phase == "over" then
+        return "selesai"
+    elseif phase == "idle" then
+        return "menunggu"
+    end
+    return tostring(phase or "-")
+end
+
+local function arenaTimeText(seconds)
+    local value = math.max(math.ceil(tonumber(seconds) or 0), 0)
+    return string.format("%d:%02d", value // 60, value % 60)
+end
+
+local function arenaAliveCount()
+    local count = 0
+    local nearest, nearestD = nil, nil
+    local ch = plr.Character
+    local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+    if not hrp or not isInArena() then
+        S.arenaAlive = 0
+        S.arenaNearest = nil
+        return 0
+    end
+    for _, m in ipairs(S.mobs) do
+        if m.Parent and m:GetAttribute("Dead") ~= true then
+            local hum = m:FindFirstChildOfClass("Humanoid")
+            if not hum or hum.Health > 0 then
+                count = count + 1
+                local d = mobDistance(hrp.Position, m)
+                if d and (not nearestD or d < nearestD) then
+                    nearest, nearestD = m, d
+                end
+            end
+        end
+    end
+    S.arenaAlive = count
+    S.arenaNearest = nearest and { model = nearest, distance = nearestD } or nil
+    return count
+end
+
+local function arenaStatusText()
+    local lines = {}
+    local st = S.arenaSt
+    lines[#lines + 1] = "Auto arena: " .. (CFG.arena and "aktif" or "mati")
+    lines[#lines + 1] = "Fase: " .. arenaPhaseLabel(S.arenaPhase)
+    if S.arenaAct or S.arenaActTitle then
+        lines[#lines + 1] = "Act: "
+            .. tostring(S.arenaAct or "-")
+            .. (S.arenaActTitle and (" - " .. tostring(S.arenaActTitle)) or "")
+    end
+    if (tonumber(S.arenaWave) or 0) > 0 then
+        lines[#lines + 1] = string.format(
+            "Wave: %d/%d (sisa spawn %d)",
+            tonumber(S.arenaWave) or 0,
+            tonumber(S.arenaOf) or 0,
+            tonumber(S.arenaLeft) or 0
+        )
+    end
+    lines[#lines + 1] = "Di arena: " .. (S.inArena and "ya" or "tidak")
+    if st and st.phase == "open" then
+        lines[#lines + 1] = "Terdaftar: " .. (S.arenaJoined and "ya" or "belum")
+        local closesAt = tonumber(st.closesAt)
+        if closesAt then
+            lines[#lines + 1] = "Pintu tutup: "
+                .. arenaTimeText(closesAt - workspace:GetServerTimeNow())
+        end
+    elseif st and st.phase == "idle" and tonumber(st.nextAt) then
+        lines[#lines + 1] = "Buka berikutnya: "
+            .. arenaTimeText((tonumber(st.nextAt) or 0) - workspace:GetServerTimeNow())
+    end
+    if S.inArena then
+        lines[#lines + 1] = "Mob arena hidup: " .. tostring(arenaAliveCount())
+        if S.arenaNearest then
+            lines[#lines + 1] = string.format(
+                "Terdekat: %s (%.1f stud)",
+                S.arenaNearest.model.Name,
+                S.arenaNearest.distance
+            )
+        end
+    end
+    lines[#lines + 1] = "Join otomatis: " .. (CFG.arenaJoin and "ON" or "OFF")
+    lines[#lines + 1] = "Fight semua mob: " .. (CFG.arenaFight and "ON" or "OFF")
+    lines[#lines + 1] = "Keluar otomatis: " .. (CFG.arenaLeave and "ON" or "OFF")
+    lines[#lines + 1] = "Radius target: " .. tostring(math.floor(tonumber(CFG.arenaRadius) or 320)) .. " stud"
+    if type(CFG.arenaSkip) == "string" and CFG.arenaSkip ~= "" then
+        lines[#lines + 1] = "Skip mob: " .. CFG.arenaSkip
+    end
+    if S.arenaJoinCount > 0 then
+        lines[#lines + 1] = "Join terkirim: " .. tostring(S.arenaJoinCount)
+    end
+    if S.arenaLeaveCount > 0 then
+        lines[#lines + 1] = "Leave terkirim: " .. tostring(S.arenaLeaveCount)
+    end
+    if S.arenaError then
+        lines[#lines + 1] = "Catatan: " .. tostring(S.arenaError)
+    end
+    return table.concat(lines, "\n")
+end
+
+local function refreshArenaCard()
+    if not S.arenaCard then
+        return
+    end
+    pcall(function()
+        S.arenaCard:SetContent(arenaStatusText())
+    end)
+end
+
+function api.SetAutoArena(on)
+    on = on and true or false
+    if on and not arenaJoinRemote then
+        S.arenaError = "remote MobRushJoin tidak ditemukan"
+        refreshArenaCard()
+        return false
+    end
+    CFG.arena = on
+    if on then
+        -- Auto arena butuh mesin Auto Farm untuk menyerang. Nyalakan kalau
+        -- sebelumnya mati; toggle Farm ikut disinkronkan.
+        if not CFG.fight then
+            CFG.fight = true
+        end
+        if not S.running then
+            S.arenaStartedFarm = true
+            api.Start()
+        end
+    elseif S.arenaStartedFarm then
+        S.arenaStartedFarm = false
+        api.Stop()
+    end
+    if S.fightToggle then
+        pcall(function()
+            S.fightToggle:Set(CFG.fight, true)
+        end)
+    end
+    if S.arenaToggle then
+        pcall(function()
+            S.arenaToggle:Set(CFG.arena, true)
+        end)
+    end
+    refreshArenaCard()
+    return CFG.arena
+end
+
+function api.SetArenaJoin(on)
+    CFG.arenaJoin = on and true or false
+    if S.arenaJoinToggle then
+        pcall(function()
+            S.arenaJoinToggle:Set(CFG.arenaJoin, true)
+        end)
+    end
+    refreshArenaCard()
+    return CFG.arenaJoin
+end
+
+function api.SetArenaFight(on)
+    CFG.arenaFight = on and true or false
+    if S.arenaFightToggle then
+        pcall(function()
+            S.arenaFightToggle:Set(CFG.arenaFight, true)
+        end)
+    end
+    refreshArenaCard()
+    return CFG.arenaFight
+end
+
+function api.SetArenaLeave(on)
+    CFG.arenaLeave = on and true or false
+    if not CFG.arenaLeave then
+        S.arenaLeaveAt = 0
+    end
+    if S.arenaLeaveToggle then
+        pcall(function()
+            S.arenaLeaveToggle:Set(CFG.arenaLeave, true)
+        end)
+    end
+    refreshArenaCard()
+    return CFG.arenaLeave
+end
+
+function api.SetArenaLeaveRun(on)
+    CFG.arenaLeaveRun = on and true or false
+    if S.arenaLeaveRunToggle then
+        pcall(function()
+            S.arenaLeaveRunToggle:Set(CFG.arenaLeaveRun, true)
+        end)
+    end
+    refreshArenaCard()
+    return CFG.arenaLeaveRun
+end
+
+function api.SetArenaRadius(studs)
+    local value = tonumber(studs)
+    if not value then
+        return false
+    end
+    CFG.arenaRadius = math.clamp(value, 60, 800)
+    if S.arenaRadiusSlider then
+        pcall(function()
+            S.arenaRadiusSlider:Set(CFG.arenaRadius, true)
+        end)
+    end
+    refreshArenaCard()
+    return CFG.arenaRadius
+end
+
+function api.SetArenaSkip(text)
+    CFG.arenaSkip = type(text) == "string" and text or ""
+    if S.arenaSkipInput then
+        pcall(function()
+            S.arenaSkipInput:Set(CFG.arenaSkip, true)
+        end)
+    end
+    S.mobsAt = 0
+    refreshArenaCard()
+    return CFG.arenaSkip
+end
+
+function api.JoinArena()
+    if isInArena() then
+        S.arenaError = "sudah berada di arena"
+        refreshArenaCard()
+        return false
+    end
+    local st = arenaState()
+    if not st then
+        S.arenaError = "state arena belum terbaca"
+        refreshArenaCard()
+        return false
+    end
+    if st.phase ~= "open" then
+        S.arenaError = "pintu arena belum terbuka (" .. arenaPhaseLabel(st.phase) .. ")"
+        refreshArenaCard()
+        return false
+    end
+    if st.joined == true then
+        S.arenaError = "sudah terdaftar, menunggu arena mulai"
+        refreshArenaCard()
+        return true
+    end
+    if not arenaJoinRemote then
+        S.arenaError = "remote MobRushJoin tidak ditemukan"
+        refreshArenaCard()
+        return false
+    end
+    local ok = pcall(function()
+        arenaJoinRemote:FireServer()
+    end)
+    if ok then
+        S.arenaLastJoin = os.clock()
+        S.arenaJoinCount = S.arenaJoinCount + 1
+        S.arenaError = nil
+    else
+        S.arenaError = "gagal mengirim MobRushJoin"
+    end
+    refreshArenaCard()
+    return ok
+end
+
+function api.LeaveArena()
+    if not isInArena() then
+        S.arenaError = "tidak sedang di arena"
+        refreshArenaCard()
+        return false
+    end
+    if not arenaLeaveRemote then
+        S.arenaError = "remote ArenaLeave tidak ditemukan"
+        refreshArenaCard()
+        return false
+    end
+    local ok = pcall(function()
+        arenaLeaveRemote:FireServer()
+    end)
+    if ok then
+        S.arenaLastLeave = os.clock()
+        S.arenaLeaveCount = S.arenaLeaveCount + 1
+        S.arenaError = nil
+    else
+        S.arenaError = "gagal mengirim ArenaLeave"
+    end
+    refreshArenaCard()
+    return ok
+end
+
+local function arenaPulse()
+    local now = os.clock()
+    S.inArena = isInArena()
+    local st = arenaState()
+    S.arenaSt = st
+    if st then
+        S.arenaPhase = st.phase
+        S.arenaWave = tonumber(st.wave) or 0
+        S.arenaOf = tonumber(st.of) or 0
+        S.arenaLeft = tonumber(st.left) or 0
+        S.arenaAct = st.act
+        S.arenaActTitle = st.actTitle
+        S.arenaUber = st.uber == true
+        S.arenaJoined = st.joined == true
+    else
+        S.arenaPhase = nil
+        S.arenaWave = 0
+        S.arenaOf = 0
+        S.arenaLeft = 0
+        S.arenaAct = nil
+        S.arenaActTitle = nil
+        S.arenaUber = false
+        S.arenaJoined = false
+    end
+
+    if S.inArena then
+        S.refreshMobScan(now)
+    end
+
+    if not CFG.arena then
+        S.arenaLeaveAt = 0
+        return
+    end
+
+    -- Auto Farm bisa ikut berhenti saat LeaveRun("hub") dipakai untuk keluar
+    -- dari run sebelum join arena. Nyalakan lagi selama Auto Arena aktif.
+    if not S.running and not S.paused and (S.inArena or (st and st.phase == "open")) then
+        api.Start()
+    end
+
+    -- 1) Daftar otomatis saat pintu terbuka.
+    if CFG.arenaJoin and not S.inArena and st and st.phase == "open" and st.joined ~= true then
+        local session = delveSession()
+        local inRun = session ~= nil and session.active ~= false
+        if inRun then
+            if CFG.arenaLeaveRun and now - S.arenaLastLeaveRun >= 10 then
+                S.arenaLastLeaveRun = now
+                if api.LeaveRun("hub") then
+                    S.arenaError = "keluar dari run Delve untuk ikut arena"
+                end
+            end
+        elseif now - S.arenaLastJoin >= (tonumber(CFG.arenaJoinCooldown) or 5) then
+            api.JoinArena()
+        end
+    end
+
+    -- 2) Keluar otomatis setelah arena selesai.
+    if CFG.arenaLeave and S.inArena and st and st.phase == "over" then
+        if S.arenaLeaveAt == 0 then
+            S.arenaLeaveAt = now + (tonumber(CFG.arenaLeaveDelay) or 4)
+        elseif now >= S.arenaLeaveAt
+            and now - S.arenaLastLeave >= (tonumber(CFG.arenaLeaveCooldown) or 12) then
+            if api.LeaveArena() then
+                S.arenaLeaveAt = 0
+            end
+        end
+    else
+        S.arenaLeaveAt = 0
+    end
+end
+
 function api.Destroy()
     S.uiAlive = false
     api.SetFly(false)
@@ -5316,6 +5899,7 @@ local Window = BPUI:CreateWindow({
 local FarmTab = Window:CreateTab({ Name = "Farm", Icon = "activity" })
 local RunTab = Window:CreateTab({ Name = "Run", Icon = "rotate-ccw" })
 local RelicTab = Window:CreateTab({ Name = "Relic", Icon = "sparkles" })
+local ArenaTab = Window:CreateTab({ Name = "Arena", Icon = "swords" })
 
 -- ------------------------------------------------------------
 -- Tab Farm
@@ -5356,7 +5940,7 @@ MainSection:AddToggle({
     end,
 })
 
-MainSection:AddToggle({
+S.fightToggle = MainSection:AddToggle({
     Name = "Auto Fight Mobs",
     Description = "Switches to the weapon and swings automatically when a mob is within range.",
     Flag = "DelveFarmFight",
@@ -5367,6 +5951,7 @@ MainSection:AddToggle({
             S.mode = nil
             S.want = "pickaxe"
         end
+        refreshArenaCard()
     end,
 })
 
@@ -5940,6 +6525,110 @@ RelicOfferSection:AddSlider({
     end,
 })
 
+-- ------------------------------------------------------------
+-- Tab Arena
+-- ------------------------------------------------------------
+
+local ArenaMainSection = ArenaTab:CreateSection("Auto Arena")
+
+S.arenaToggle = ArenaMainSection:AddToggle({
+    Name = "Auto Arena",
+    Description = "Turns Auto Farm on and handles the hub arena (MobRush): joins when the doors open, fights every living mob, and optionally leaves when the arena ends.",
+    Flag = "DelveAutoArena",
+    Default = CFG.arena,
+    Callback = function(on)
+        api.SetAutoArena(on)
+    end,
+})
+
+S.arenaJoinToggle = ArenaMainSection:AddToggle({
+    Name = "Auto Join",
+    Description = "Sends MobRushJoin automatically while the arena doors are open (phase open) and you are in the hub. If you are in a Delve run, enable Leave Run to Join below.",
+    Flag = "DelveArenaJoin",
+    Default = CFG.arenaJoin,
+    Callback = function(on)
+        api.SetArenaJoin(on)
+    end,
+})
+
+S.arenaFightToggle = ArenaMainSection:AddToggle({
+    Name = "Attack All Arena Mobs",
+    Description = "Ignores Focus Mining while inside the arena and widens the target radius, so mobs that spawn far from the character are chased instead of left alive.",
+    Flag = "DelveArenaFight",
+    Default = CFG.arenaFight,
+    Callback = function(on)
+        api.SetArenaFight(on)
+    end,
+})
+
+S.arenaLeaveToggle = ArenaMainSection:AddToggle({
+    Name = "Auto Leave When Arena Ends",
+    Description = "Sends ArenaLeave a few seconds after the arena phase becomes over.",
+    Flag = "DelveArenaLeave",
+    Default = CFG.arenaLeave,
+    Callback = function(on)
+        api.SetArenaLeave(on)
+    end,
+})
+
+S.arenaLeaveRunToggle = ArenaMainSection:AddToggle({
+    Name = "Leave Run to Join",
+    Description = "If the arena opens while you are inside a Delve run, ends the run and returns to the hub first. Off by default because the current run is lost.",
+    Flag = "DelveArenaLeaveRun",
+    Default = CFG.arenaLeaveRun,
+    Callback = function(on)
+        api.SetArenaLeaveRun(on)
+    end,
+})
+
+S.arenaRadiusSlider = ArenaMainSection:AddSlider({
+    Name = "Target Radius",
+    Description = "Maximum distance for arena mobs. Increase it if a wave stalls because a mob is far away. Full arena coverage is usually 250-350 studs.",
+    Min = 60,
+    Max = 600,
+    Default = CFG.arenaRadius,
+    Increment = 10,
+    Suffix = " stud",
+    Flag = "DelveArenaRadius",
+    Callback = function(v)
+        CFG.arenaRadius = v
+    end,
+})
+
+S.arenaSkipInput = ArenaMainSection:AddInput({
+    Name = "Skip Mobs",
+    Description = "Optional. Names or MobKind values that should NOT be attacked in the arena, separated by commas (for example: treasure_goblin, archer). Leave blank to attack every mob.",
+    Default = CFG.arenaSkip,
+    Placeholder = "e.g. treasure_goblin, archer",
+    Flag = "DelveArenaSkip",
+    Callback = function(text)
+        api.SetArenaSkip(text)
+    end,
+})
+
+local ArenaActionSection = ArenaTab:CreateSection("Manual")
+
+ArenaActionSection:AddButton({
+    Name = "Join Arena Now",
+    Description = "Manual test. Only works while the arena doors are open.",
+    Callback = function()
+        api.JoinArena()
+    end,
+})
+
+ArenaActionSection:AddButton({
+    Name = "Leave Arena Now",
+    Description = "Sends ArenaLeave immediately if the character is inside the arena.",
+    Callback = function()
+        api.LeaveArena()
+    end,
+})
+
+S.arenaCard = ArenaActionSection:AddParagraph({
+    Title = "Arena Status",
+    Content = arenaStatusText(),
+})
+
 -- ============================================================
 -- Loop
 -- ============================================================
@@ -5957,6 +6646,21 @@ S.prestigeThread = task.spawn(function()
     while S.alive do
         if S.prestigeCard then
             pcall(Prestige.refreshCard)
+        end
+        task.wait(0.5)
+    end
+end)
+
+-- Arena: auto join / leave berjalan terpisah dari tick Auto Farm supaya
+-- pintu arena tetap dipantau walau karakter sedang menambang atau idle.
+S.arenaThread = task.spawn(function()
+    while S.alive do
+        local ok, err = pcall(arenaPulse)
+        if not ok then
+            S.arenaError = tostring(err)
+        end
+        if S.arenaCard then
+            pcall(refreshArenaCard)
         end
         task.wait(0.5)
     end
