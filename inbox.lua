@@ -286,24 +286,51 @@ local BPUI_URLS = {
     "https://raw.githubusercontent.com/bypasshubpremium/BPUINEW/main/BPUI.lua",
     "https://cdn.jsdelivr.net/gh/bypasshubpremium/BPUINEW@main/BPUI.lua",
 }
+local function loadBpuiSource(src)
+    local fn, compileErr = compileSource(src)
+    if not fn then
+        return nil, compileErr
+    end
+    local ok, res = pcall(fn)
+    if ok and type(res) == "table" then
+        return res
+    end
+    return nil, res
+end
+
 local BPUI = nil
 local BPUI_ERR = nil
-for _, url in ipairs(BPUI_URLS) do
-    local src, fetchErr = fetchSource(url)
-    if src then
-        local fn, compileErr = compileSource(src)
-        if fn then
-            local ok, res = pcall(fn)
-            if ok and type(res) == "table" then
+
+-- 1) File lokal (paling aman untuk Android yang memblokir HTTP).
+-- Taruh BPUI.lua di folder yang sama dengan inbox.lua.
+if type(readfile) == "function" then
+    for _, path in ipairs({ "AIBridge/BPUI.lua", "BPUI.lua" }) do
+        local ok, src = pcall(readfile, path)
+        if ok and type(src) == "string" and #src > 1000 then
+            local res, loadErr = loadBpuiSource(src)
+            if res then
                 BPUI = res
                 break
             end
-            BPUI_ERR = res
-        else
-            BPUI_ERR = compileErr
+            BPUI_ERR = loadErr
         end
-    else
-        BPUI_ERR = fetchErr
+    end
+end
+
+-- 2) HTTP, dengan beberapa URL dan beberapa metode request.
+if type(BPUI) ~= "table" then
+    for _, url in ipairs(BPUI_URLS) do
+        local src, fetchErr = fetchSource(url)
+        if src then
+            local res, loadErr = loadBpuiSource(src)
+            if res then
+                BPUI = res
+                break
+            end
+            BPUI_ERR = loadErr
+        else
+            BPUI_ERR = fetchErr
+        end
     end
 end
 if type(BPUI) ~= "table" then
