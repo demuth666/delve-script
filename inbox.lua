@@ -4727,7 +4727,7 @@ function api.SetDepthTarget(meters)
         end
         return false
     end
-    CFG.depthLeaveAt = math.clamp(math.floor(value + 0.5), 50, 20000)
+    CFG.depthLeaveAt = math.max(50, math.floor(value + 0.5))
     if CFG.depthLeave then
         S.depthLeaveArmed = false
     end
