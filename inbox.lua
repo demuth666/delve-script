@@ -5172,7 +5172,10 @@ end
 
 function api.SetDepthTarget(meters)
     local value = tonumber(meters)
-    if not value then
+    -- Tanpa batas atas: target boleh sejauh apa pun. Nilai tak hingga (inf)
+    -- tetap ditolak karena depth >= inf tidak akan pernah tercapai, jadi
+    -- fitur auto leave diam-diam tidak jalan.
+    if not value or value ~= value or math.abs(value) == math.huge then
         if S.depthInput then
             pcall(function()
                 S.depthInput:Set(tostring(CFG.depthLeaveAt), true)
@@ -5180,7 +5183,7 @@ function api.SetDepthTarget(meters)
         end
         return false
     end
-    CFG.depthLeaveAt = math.clamp(math.floor(value + 0.5), 50, 20000)
+    CFG.depthLeaveAt = math.max(50, math.floor(value + 0.5))
     if CFG.depthLeave then
         S.depthLeaveArmed = false
     end
