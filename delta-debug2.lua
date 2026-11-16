@@ -87,7 +87,11 @@ label.Parent = frame
 
 local lines = {}
 local function log(...)
-    local line = table.concat({...}, " ")
+    local parts = { ... }
+    for i = 1, #parts do
+        parts[i] = tostring(parts[i])
+    end
+    local line = table.concat(parts, " ")
     status.Text = "STATUS: " .. line
     lines[#lines + 1] = line
     label.Text = table.concat(lines, "\n")
