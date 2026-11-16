@@ -1,7 +1,7 @@
 --[[
   Delta / Android debug panel untuk Delve Hub.
   Menampilkan status remote dan menguji filtergc yang dipanggil
-  sebelum UI hub dibuat. Panel sengaja kecil (90% x 38%) dan muncul
+  sebelum UI hub dibuat. Panel di tengah layar (90% x 38%), muncul
   lebih dulu, jadi kalau filtergc hang, baris terakhir tetap terbaca.
 
   Pakai:
@@ -29,7 +29,8 @@ gui.Parent = pg
 
 local frame = Instance.new("Frame")
 frame.Size = UDim2.new(0.9, 0, 0.38, 0)
-frame.Position = UDim2.new(0.05, 0, 0.03, 0)
+frame.AnchorPoint = Vector2.new(0.5, 0.5)
+frame.Position = UDim2.fromScale(0.5, 0.5)
 frame.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
 frame.BackgroundTransparency = 0.1
 frame.BorderSizePixel = 0
