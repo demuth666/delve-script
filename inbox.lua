@@ -79,6 +79,10 @@
         lap berikutnya (prestige) dimulai tanpa perlu jalan manual ke portal.
         Portal ReturnGate milik Vesper Sanctum di hub selalu diabaikan.
         Toggle ada di tab Run > Auto Prestige.
+    18. Arena (MobRush): selama atribut InArena aktif, hub menyerang semua
+        mob arena tanpa filter Focus Mining dan memperlebar radius target
+        sampai 320 stud. Archer menjaga jarak dan menembak dari jauh, jadi
+        tanpa radius lebar mob ini tertinggal dan wave tidak pernah selesai.
 
   Catatan protokol (dibaca dari StrataClient.Controllers):
     - MiningInput mengirim StrataNet.Aim:FireServer(x, z, true) lalu Aim(0, 0, false) saat lepas.
@@ -173,6 +177,10 @@ local CFG = {
     autoEquip = true,
     chase = true,
     focusMining = true,        -- Delve: mob hanya dilawan di room gate/boss
+
+    -- arena (MobRush di hub)
+    arenaFight = true,         -- di arena semua mob dicari, tanpa filter Focus Mining
+    arenaRadius = 320,         -- radius target mob arena, stud (arena +/- 80 stud)
 
     -- anti AFK
     antiAfk = true,            -- cegah kick idle Roblox lewat sinyal Idled
@@ -701,9 +709,21 @@ local function focusMiningActive(session)
     return session ~= nil and session.worldId == "delve"
 end
 
+-- Arena MobRush berjalan di hub, bukan di sesi Delve. Selama InArena aktif,
+-- semua mob arena menahan wave berikutnya, jadi Focus Mining tidak boleh
+-- melewati mereka. Radius tempur biasa (30/42 stud) juga terlalu kecil:
+-- Archer menjaga jarak 22 stud dan menembak dari range 48, sehingga sering
+-- tertinggal jauh di sisi lain arena.
+local function isInArena()
+    return plr:GetAttribute("InArena") == true
+end
+
 local function combatWanted(session)
     if not CFG.fight then
         return false
+    end
+    if isInArena() and CFG.arenaFight then
+        return true
     end
     if not focusMiningActive(session) then
         return true
@@ -944,6 +964,7 @@ end
 local function scanMobs()
     local list = {}
     local myRun = plr:GetAttribute("RunId")
+    local inArena = isInArena()
     for _, m in ipairs(workspace:GetChildren()) do
         -- Guardian kadang tidak punya MobId. Game sendiri mendeteksi mob lewat
         -- atribut Guardian (GateController / AudioController), jadi ikutkan.
@@ -953,7 +974,13 @@ local function scanMobs()
                 local part = m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart")
                 if part and (not hum or hum.Health > 0) then
                     local mobRun = m:GetAttribute("RunId")
-                    if myRun == nil or mobRun == nil or mobRun == myRun then
+                    -- RunId arena ikut diterima walau sempat berbeda dari RunId
+                    -- pemain saat wave/act berganti; kalau tidak, mob wave baru
+                    -- tidak pernah masuk daftar target.
+                    local arenaTagged = inArena
+                        and type(mobRun) == "string"
+                        and string.find(string.lower(mobRun), "arena", 1, true) ~= nil
+                    if arenaTagged or myRun == nil or mobRun == nil or mobRun == myRun then
                         table.insert(list, m)
                     end
                 end
@@ -1079,6 +1106,12 @@ local function nearestMob(pos)
         -- Mob pengunci area bisa tersebar di seluruh room; jangan berhenti
         -- menyerang hanya karena target berikutnya di luar radius tempur biasa.
         radius = math.max(radius, CFG.blockedMobRadius)
+    end
+    if isInArena() and CFG.arenaFight then
+        -- Arena: mob spawn tersebar di seluruh koloseum. Radius 30/42 membuat
+        -- Archer yang menjaga jarak (keepAway 22, range 48) tidak pernah
+        -- dikejar setelah mob lain mati.
+        radius = math.max(radius, tonumber(CFG.arenaRadius) or 320)
     end
     -- Room gate: guardian bisa spawn jauh di ujung room. Selama room gate
     -- belum selesai, cari sampai radius jauh supaya hub tidak diam menunggu
