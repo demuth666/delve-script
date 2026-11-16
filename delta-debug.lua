@@ -1,8 +1,11 @@
 --[[
   Delta / Android debug panel untuk Delve Hub.
   Menampilkan status remote dan menguji filtergc yang dipanggil
-  sebelum UI hub dibuat. Panel di tengah layar (90% x 38%), muncul
-  lebih dulu, jadi kalau filtergc hang, baris terakhir tetap terbaca.
+  sebelum UI hub dibuat.
+
+  Baris paling atas (STATUS) selalu menampilkan kejadian terbaru,
+  jadi kalau filtergc hang / script berhenti, penyebabnya tetap
+  kelihatan walaupun log di bawah terpotong.
 
   Pakai:
     loadstring(game:HttpGet("https://raw.githubusercontent.com/demuth666/delve-script/main/delta-debug.lua"))()
@@ -28,7 +31,7 @@ gui.IgnoreGuiInset = true
 gui.Parent = pg
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.new(0.9, 0, 0.38, 0)
+frame.Size = UDim2.new(0.9, 0, 0.42, 0)
 frame.AnchorPoint = Vector2.new(0.5, 0.5)
 frame.Position = UDim2.fromScale(0.5, 0.5)
 frame.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
@@ -36,22 +39,21 @@ frame.BackgroundTransparency = 0.1
 frame.BorderSizePixel = 0
 frame.Parent = gui
 
-local label = Instance.new("TextLabel")
-label.Size = UDim2.new(1, -12, 1, -40)
-label.Position = UDim2.new(0, 6, 0, 34)
-label.BackgroundTransparency = 1
-label.TextColor3 = Color3.new(1, 1, 1)
-label.TextSize = 12
-label.TextWrapped = true
-label.Font = Enum.Font.Code
-label.TextXAlignment = Enum.TextXAlignment.Left
-label.TextYAlignment = Enum.TextYAlignment.Top
-label.Text = "start"
-label.Parent = frame
+local status = Instance.new("TextLabel")
+status.Size = UDim2.new(1, -90, 0, 24)
+status.Position = UDim2.new(0, 6, 0, 5)
+status.BackgroundTransparency = 1
+status.TextColor3 = Color3.fromRGB(255, 220, 120)
+status.TextSize = 12
+status.Font = Enum.Font.Code
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.TextTruncate = Enum.TextTruncate.AtEnd
+status.Text = "STATUS: start"
+status.Parent = frame
 
 local close = Instance.new("TextButton")
 close.Size = UDim2.new(0, 70, 0, 24)
-close.Position = UDim2.new(1, -76, 0, 6)
+close.Position = UDim2.new(1, -76, 0, 5)
 close.BackgroundColor3 = Color3.fromRGB(70, 25, 30)
 close.TextColor3 = Color3.new(1, 1, 1)
 close.TextSize = 14
@@ -62,9 +64,24 @@ close.MouseButton1Click:Connect(function()
     gui:Destroy()
 end)
 
+local label = Instance.new("TextLabel")
+label.Size = UDim2.new(1, -12, 1, -38)
+label.Position = UDim2.new(0, 6, 0, 32)
+label.BackgroundTransparency = 1
+label.TextColor3 = Color3.new(1, 1, 1)
+label.TextSize = 11
+label.TextWrapped = true
+label.Font = Enum.Font.Code
+label.TextXAlignment = Enum.TextXAlignment.Left
+label.TextYAlignment = Enum.TextYAlignment.Top
+label.Text = ""
+label.Parent = frame
+
 local lines = {}
 local function log(...)
-    lines[#lines + 1] = table.concat({...}, " ")
+    local line = table.concat({...}, " ")
+    status.Text = "STATUS: " .. line
+    lines[#lines + 1] = line
     label.Text = table.concat(lines, "\n")
 end
 
